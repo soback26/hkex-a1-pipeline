@@ -1,0 +1,32 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Excel temp / lock files
+~$*.xlsx
+~$*.xls
+*.tmp
+
+# Python (in case scripts/ gets Python files later)
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.env.local
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Secrets — never commit
+*.key
+*.pem
+credentials.json
+
+# PDF scrape cache (Phase 0 downloads)
+checkpoints/
