@@ -4,7 +4,7 @@
 
 A **HKEX A1 pre-IPO life-science tracker**. Monitors every Application Proof filing by Chinese biotech / medtech / healthcare services companies on the Hong Kong Stock Exchange from 2024 onward, including re-filings after 6-month lapses. Output is a single 14-column Excel tracker sorted by filing date descending.
 
-The canonical Python scraper (`scripts/hkex_scraper.py`, 1500 LOC) and its standalone usage docs (`scripts/README.md`) live in this repo and are the source of truth for HKEX feed fetching, TOC parsing, chapter download, pdfplumber financial extraction, regex sponsor extraction, and the Firecrawl MCP narrative-field schema. The full 5-phase investment workflow that wraps the scraper (Gate 1 candidate approval, Gate 2 diff preview, Phase 5 save invariants) is maintained in a private companion repository — this CLAUDE.md is the public-safe repo-local operational guide covering file layout, commit conventions, and save-time invariants.
+The canonical Python scraper (`scripts/hkex_scraper.py`, 1500 LOC) and its standalone usage docs (`scripts/README.md`) live in this repo and are the source of truth for HKEX feed fetching, TOC parsing, chapter download, pdfplumber financial extraction, regex sponsor extraction, and the Firecrawl MCP narrative-field schema. The full 5-phase investment workflow that wraps the scraper (Gate 1 candidate approval, Gate 2 diff preview, Phase 5 save invariants) ships with this repo as a **project-level Claude Code skill** at [`.claude/skills/a1-pipeline-update/SKILL.md`](./.claude/skills/a1-pipeline-update/SKILL.md) — open the repo in Claude Code and the skill auto-activates. This CLAUDE.md covers file layout, commit conventions, and save-time invariants; the skill covers Phase 0 scraping orchestration, Gate 1/Gate 2 prompts, and the hybrid extraction pipeline. See [`README.md → Setup & Usage`](./README.md#setup--usage) for end-to-end run instructions.
 
 ---
 
@@ -37,7 +37,7 @@ hkex-a1-pipeline/
 
 ## Update Workflow
 
-All updates go through the private 5-phase skill that wraps `scripts/hkex_scraper.py`. When the user says "update A1 tracker", "A1 update", "scan HKEX for new A1s", or any equivalent, invoke that skill and let it drive the pipeline. Do not hand-edit the Excel — every save must pass the Phase 5 invariants (HKEX feed verification, dedup, DESC sort, `dd/mm/yyyy`, Arial 8 black, zero fills). The scraper module itself is open-source and self-contained in `scripts/`; the investment-workflow wrapper around it is not.
+All updates go through the 5-phase skill at [`.claude/skills/a1-pipeline-update/SKILL.md`](./.claude/skills/a1-pipeline-update/SKILL.md), which wraps `scripts/hkex_scraper.py`. When the user says "update A1 tracker", "A1 update", "scan HKEX for new A1s", or any equivalent, Claude Code auto-activates the skill and drives the pipeline. Do not hand-edit the Excel — every save must pass the Phase 5 invariants (HKEX feed verification, dedup, DESC sort, `dd/mm/yyyy`, Arial 8 black, zero fills). Both the scraper module (`scripts/hkex_scraper.py`) and the investment-workflow wrapper (the skill) now ship with this repo — clone it, install deps, configure Firecrawl MCP, and the full pipeline is reproducible end-to-end.
 
 ### Two modes
 

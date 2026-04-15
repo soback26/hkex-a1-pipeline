@@ -9,6 +9,7 @@
 
 - [Purpose](#purpose)
 - [Coverage Snapshot](#coverage-snapshot)
+- [Setup & Usage](#setup--usage)
 - [Repository Layout](#repository-layout)
 - [Tracker Schema](#tracker-schema)
 - [Update Workflow](#update-workflow)
@@ -62,6 +63,68 @@ As of the most recent update (see `tracker/a1_pipeline_tracker.xlsx` row 1 metad
 
 ---
 
+## Setup & Usage
+
+### Prerequisites
+
+1. **Python 3.9+** with the scraper's dependencies:
+   ```bash
+   pip install -r scripts/requirements.txt
+   ```
+   Installs `requests`, `beautifulsoup4`, `pdfplumber`, and `openpyxl`.
+
+2. **[Claude Code](https://claude.com/claude-code) CLI** — required to run the guided 5-phase update pipeline. This repo ships a project-level skill at [`.claude/skills/a1-pipeline-update/SKILL.md`](./.claude/skills/a1-pipeline-update/SKILL.md) that auto-activates when you open the repo in Claude Code.
+
+3. **Firecrawl MCP** — required for **Mode B** (HKEX auto-scrape). The scraper uses Firecrawl's LLM-backed schema extraction to fill narrative fields F/G/H/M (shareholder structure / business model / sector / lead asset) from the SUMMARY chapter URL of each candidate's prospectus. Register a free Firecrawl API key at [firecrawl.dev](https://firecrawl.dev) — the free tier gives 500 credits/month, a typical monthly run burns ~60 credits (8× safety margin) — then add it to Claude Code at user scope:
+   ```bash
+   claude mcp add firecrawl https://mcp.firecrawl.dev/<your-api-key>/v2/mcp
+   ```
+
+   **Without Firecrawl**: Mode B still runs — Phase 0 pulls the JSON feed, downloads chapter PDFs, and extracts J/K/L + I deterministically — but F/G/H/M land as `None` with `firecrawl_pending_col_X` QC flags so you can fill them manually during the Gate 2 review. Mode A (user-supplied Excel) does not depend on Firecrawl.
+
+### Running a monthly update
+
+```bash
+# Launch Claude Code from the repo root
+cd hkex-a1-pipeline
+claude
+```
+
+Then tell Claude which mode you want:
+
+**Mode A** (you have a pre-typed Excel with new rows):
+
+```
+> update the A1 tracker using raw/2026-04-15.xlsx
+```
+
+**Mode B** (full auto-scrape from the HKEX feed):
+
+```
+> scan HKEX for new A1s
+```
+
+Claude will drive the 5-phase pipeline via the project-level skill:
+
+1. **Phase 0** (Mode B only): fetch the HKEX Application Proof JSON feed → pre-filter life-science candidates → **Gate 1** (show NEW / REFRESH / SKIP bucket list, wait for your approval) → download SUMMARY / BUSINESS / FINANCIAL chapter PDFs for each approved candidate → extract J/K/L via `pdfplumber`, I via regex, F/G/H/M via Firecrawl.
+2. **Phase 1** — inspect the new rows + existing master tracker, build the tracker-match index.
+3. **Phase 2** — classify each candidate as `TRULY NEW` / `DATA RECOVERY` / `DUPLICATE`.
+4. **Phase 3** — fill in cols E–N (prospectus + web research), pausing on any ambiguity (e.g., col F can't be resolved from the prospectus, unfamiliar sector).
+5. **Phase 4 — Gate 2 diff preview** (⚠️ **mandatory**): Claude shows the projected tracker state, full list of new rows, data recoveries, duplicates to delete, and any QC flags, then **waits for your explicit `yes` / `go` / `OK`** before writing anything. Say `dry run only` at any point to exit cleanly without file changes.
+6. **Phase 5 — write + QC**: preserves the Arial 8 black formatting, enforces all 12 save-time invariants ([`CLAUDE.md → Save-Time Invariants`](./CLAUDE.md)), drops a snapshot into `archive/`, overwrites the live tracker, prepares a commit with the standard `update: YYYY-MM-DD | +N new, +R refreshed, -D deduped | <summary>` format, and **asks before pushing**.
+
+### Invoking the skill directly
+
+If Claude doesn't auto-pick up the workflow from your natural-language phrasing, invoke the skill explicitly in Claude Code:
+
+```
+/a1-pipeline-update
+```
+
+Or use any of the trigger phrases: `update A1 tracker`, `A1 update`, `scan HKEX for new A1s`, `pull latest A1 filings`, `抓一下 HKEX`, `月度 A1 更新`, `更新 A1 tracker`, `港股 pre-IPO 跟踪`.
+
+---
+
 ## Repository Layout
 
 ```
@@ -69,20 +132,24 @@ hkex-a1-pipeline/
 ├── README.md                        # This file — project overview
 ├── CLAUDE.md                        # Update rules and field conventions
 ├── LICENSE                          # MIT
+├── .claude/
+│   └── skills/
+│       └── a1-pipeline-update/
+│           └── SKILL.md             # Project-level Claude Code skill — full 5-phase workflow
 ├── tracker/
 │   └── a1_pipeline_tracker.xlsx     # Master tracker — 14 columns, DESC sort
 ├── archive/
-│   └── A1 pipeline_<Mon> <Year>_update_v<N>.xlsx  # Historical monthly versions
-├── raw/                             # (Reserved for monthly input files)
+│   └── A1 pipeline_<Mon> <Year>_update_v<N>.xlsx  # Historical monthly snapshots
+├── raw/                             # (Reserved for Mode A monthly input files)
 └── scripts/
     ├── hkex_scraper.py              # Canonical Python scraper (1500 LOC)
     ├── requirements.txt             # requests / bs4 / pdfplumber / openpyxl
     └── README.md                    # Python API docs + Firecrawl MCP setup
 ```
 
-The canonical Python automation lives in [`scripts/hkex_scraper.py`](scripts/hkex_scraper.py) — a standalone module that pulls the HKEX Application Proof feed, filters life-science candidates, downloads SUMMARY/BUSINESS/FINANCIAL chapter PDFs, and extracts structured fields via a **hybrid pipeline**: `pdfplumber` table parser for financial numbers, regex for sponsor bank names, and **Firecrawl MCP** (`mcp__firecrawl__scrape` with a JSON schema) for narrative fields (shareholder structure, business model, sector, lead asset). See [`scripts/README.md`](scripts/README.md) for installation, Firecrawl MCP setup, and the full Python API reference.
+The canonical Python automation lives in [`scripts/hkex_scraper.py`](scripts/hkex_scraper.py) — a standalone module that pulls the HKEX Application Proof feed, filters life-science candidates, downloads SUMMARY/BUSINESS/FINANCIAL chapter PDFs, and extracts structured fields via a **hybrid pipeline**: `pdfplumber` table parser for financial numbers, regex for sponsor bank names, and **Firecrawl MCP** (`mcp__firecrawl__scrape` with a JSON schema) for narrative fields (shareholder structure, business model, sector, lead asset). See [`scripts/README.md`](scripts/README.md) for the full Python API reference.
 
-A companion private repository wraps this scraper in a 5-phase investment workflow (candidate approval gates, diff preview, save-time QC invariants) — that wrapper is not open-sourced, but everything you need to run the scraper is here.
+The 5-phase investment workflow that wraps this scraper (candidate approval gates, diff preview, save-time QC invariants) ships with this repo as a **project-level Claude Code skill** at [`.claude/skills/a1-pipeline-update/SKILL.md`](./.claude/skills/a1-pipeline-update/SKILL.md). Open the repo in Claude Code and the skill auto-activates — see [Setup & Usage](#setup--usage) above for the end-to-end run walkthrough.
 
 ---
 
@@ -175,6 +242,6 @@ Chapters only — the scraper never downloads the full prospectus (30-60 MB each
 - This is a **working repository**. Tracker contents reflect curated analyst judgment on companies at the A1 stage and are based on public HKEX filings.
 - All company data is sourced from public HKEX documents and news sources; **no MNPI** is captured here.
 - Highlights / Updates notes (col N) are **internal opinions** for screening purposes only and do not constitute investment recommendations.
-- Col F taxonomy, Col G format, and the QC invariants are documented in `CLAUDE.md`. The 5-phase investment workflow that wraps the Python scraper lives in a private companion repo and is not open-sourced.
+- Col F taxonomy, Col G format, and the QC invariants are documented in [`CLAUDE.md`](./CLAUDE.md). The 5-phase investment workflow that wraps the Python scraper ships with this repo as a project-level Claude Code skill at [`.claude/skills/a1-pipeline-update/SKILL.md`](./.claude/skills/a1-pipeline-update/SKILL.md) and auto-activates when the repo is opened in Claude Code.
 - Related public repository:
   - [`soback26/biotech-bd-tracker`](https://github.com/soback26/biotech-bd-tracker) — cross-border out-licensing deal tracker (GC/JP/KR → Western pharma)
