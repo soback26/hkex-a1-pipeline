@@ -129,7 +129,7 @@ All HTTP calls respect an internal 0.8-second minimum gap between HKEX requests,
 
 ## Not included
 
-This module is the scraping / extraction layer only. The full monthly workflow (Gate 1 candidate approval, Gate 2 diff preview, Phase 5 save invariants — Arial 8 black font, zero fills, dd/mm/yyyy date format, dedup, DESC sort) lives in a companion private repository. The module's Python API is designed so that you can plug in your own workflow wrapper on top.
+This module is the scraping / extraction layer only. The full monthly workflow (Gate 1 candidate approval, Gate 2 diff preview, Phase 5 save invariants — Arial 8 black font, zero fills, dd/mm/yyyy date format, dedup, DESC sort) lives in a sibling Claude Code skill at [`../.claude/skills/a1-pipeline-update/SKILL.md`](../.claude/skills/a1-pipeline-update/SKILL.md), shipped in this same repo. Open the repo in [Claude Code](https://claude.com/claude-code) and the skill auto-activates — see the repo's top-level [`README.md → Setup & Usage`](../README.md#setup--usage) for the end-to-end run walkthrough. The Python API documented above is the layer the skill calls into; you can also plug in your own workflow wrapper on top if you prefer.
 
 ## License
 
