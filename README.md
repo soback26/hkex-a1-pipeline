@@ -74,10 +74,15 @@ hkex-a1-pipeline/
 ├── archive/
 │   └── A1 pipeline_<Mon> <Year>_update_v<N>.xlsx  # Historical monthly versions
 ├── raw/                             # (Reserved for monthly input files)
-└── scripts/                         # (Reserved for future automation)
+└── scripts/
+    ├── hkex_scraper.py              # Canonical Python scraper (1500 LOC)
+    ├── requirements.txt             # requests / bs4 / pdfplumber / openpyxl
+    └── README.md                    # Python API docs + Firecrawl MCP setup
 ```
 
-The authoritative workflow lives in the `/a1-pipeline-update` skill at [`soback26/lifesci-methodology`](https://github.com/soback26/lifesci-methodology/blob/main/skills/a1-pipeline-update/SKILL.md). This repo is the **working data warehouse** — the skill is the **methodology**.
+The canonical Python automation lives in [`scripts/hkex_scraper.py`](scripts/hkex_scraper.py) — a standalone module that pulls the HKEX Application Proof feed, filters life-science candidates, downloads SUMMARY/BUSINESS/FINANCIAL chapter PDFs, and extracts structured fields via a **hybrid pipeline**: `pdfplumber` table parser for financial numbers, regex for sponsor bank names, and **Firecrawl MCP** (`mcp__firecrawl__scrape` with a JSON schema) for narrative fields (shareholder structure, business model, sector, lead asset). See [`scripts/README.md`](scripts/README.md) for installation, Firecrawl MCP setup, and the full Python API reference.
+
+A companion private repository wraps this scraper in a 5-phase investment workflow (candidate approval gates, diff preview, save-time QC invariants) — that wrapper is not open-sourced, but everything you need to run the scraper is here.
 
 ---
 
@@ -114,7 +119,7 @@ Single sheet, 14 columns:
 
 ## Update Workflow
 
-The tracker is refreshed **monthly** via the `/a1-pipeline-update` skill. Two modes:
+The tracker is refreshed **monthly** via a Python workflow built on top of [`scripts/hkex_scraper.py`](scripts/hkex_scraper.py). Two modes:
 
 ### Mode A — User supplies a pre-typed monthly Excel
 
@@ -122,7 +127,7 @@ Drop a new Excel into `raw/` (or point the skill at it directly) with new compan
 
 ### Mode B — Phase 0 HKEX auto-scraper
 
-Trigger phrase: *"scan HKEX for new A1s"* / *"抓一下 HKEX"*. The skill reaches into the HKEX JSON feed (`app_{YYYY}_sehk_{e|c}.json`), pulls every Application Proof record, applies a keyword + `-B`/`-P` suffix pre-filter to surface life-science candidates, and matches each candidate against the existing tracker. A **Gate 1** approval checkpoint shows the NEW / REFRESH / SKIP buckets before any PDF is downloaded. Approved candidates get their SUMMARY / BUSINESS / FINANCIAL INFORMATION chapters fetched from HKEX Multi-Files pages, parsed with `pdfplumber`, and written through the standard 5-phase pipeline.
+Trigger phrase: *"scan HKEX for new A1s"* / *"抓一下 HKEX"*. The Python scraper (`scripts/hkex_scraper.py`) reaches into the HKEX JSON feed (`app_{YYYY}_sehk_{e|c}.json`), pulls every Application Proof record, applies a keyword + `-B`/`-P` suffix pre-filter to surface life-science candidates, and matches each candidate against the existing tracker. A **Gate 1** approval checkpoint shows the NEW / REFRESH / SKIP buckets before any PDF is downloaded. Approved candidates get their SUMMARY / BUSINESS / FINANCIAL INFORMATION chapters fetched from HKEX Multi-Files pages, then extracted via the hybrid pipeline described in [Data Source](#data-source) below, and written through the 5-phase pipeline.
 
 Both modes converge at the same **Phase 4 Gate 2 diff preview** (mandatory checkpoint before any write), then run the Phase 5 save sequence:
 
@@ -154,7 +159,14 @@ Previous monthly versions move to `archive/` with their original `A1 pipeline_<M
 3. Chinese financial news (sina finance, cls.cn, phirda, 医药魔方)
 4. English databases (PitchBook, BioCentury) as last resort
 
-**Prospectus chapter extraction**: `pdfplumber` on FINANCIAL for J/K/L; pdfplumber + regex heuristics on SUMMARY/BUSINESS for F/G/H/I/M; assembled N with FY marker. Chapters only — the skill never downloads the full prospectus (30-60 MB each) — just the three relevant sections (~5-10 MB total per candidate).
+**Prospectus chapter extraction** (hybrid pipeline):
+
+- **`pdfplumber` table parser** on FINANCIAL for cols J/K/L (FY revenue / net income / cash) — deterministic positional parsing with RMB unit detection. Numbers need exact extraction, so LLMs are avoided here.
+- **Regex on pdfplumber SUMMARY text** for col I (sponsor bank names) — sponsor sections are templated ("Sole Sponsor: XYZ Bank" / "Joint Sponsors: A, B and C"), so regex is reliable and deterministic.
+- **Firecrawl MCP (`mcp__firecrawl__scrape` with a JSON schema)** on the SUMMARY chapter URL for cols F/G/H/M (shareholder structure, business model, sector, lead asset) — LLM-backed schema extraction is dramatically more accurate than regex for prose-heavy semantic fields, especially for distinguishing VIE from plain Cayman/BVI holdco and for matching a company's MAIN business (rather than incidental vendor references) against the canonical sector taxonomy. Schema enforces enum constraints so the LLM can't return off-ontology values.
+- **Col N (highlights)** assembled from FY label + pdf_status flags.
+
+Chapters only — the scraper never downloads the full prospectus (30-60 MB each) — just the three relevant sections (~5 MB total per candidate). See [`scripts/README.md`](scripts/README.md) for the full Python API and Firecrawl MCP setup.
 
 ---
 
@@ -163,7 +175,6 @@ Previous monthly versions move to `archive/` with their original `A1 pipeline_<M
 - This is a **working repository**. Tracker contents reflect curated analyst judgment on companies at the A1 stage and are based on public HKEX filings.
 - All company data is sourced from public HKEX documents and news sources; **no MNPI** is captured here.
 - Highlights / Updates notes (col N) are **internal opinions** for screening purposes only and do not constitute investment recommendations.
-- Col F taxonomy, Col G format, and the 12-item QC checklist are subject to periodic revision — see `CLAUDE.md` for the current canonical version, and the [`/a1-pipeline-update` skill](https://github.com/soback26/lifesci-methodology/blob/main/skills/a1-pipeline-update/SKILL.md) for the authoritative workflow.
-- Related repositories:
+- Col F taxonomy, Col G format, and the QC invariants are documented in `CLAUDE.md`. The 5-phase investment workflow that wraps the Python scraper lives in a private companion repo and is not open-sourced.
+- Related public repository:
   - [`soback26/biotech-bd-tracker`](https://github.com/soback26/biotech-bd-tracker) — cross-border out-licensing deal tracker (GC/JP/KR → Western pharma)
-  - [`soback26/lifesci-methodology`](https://github.com/soback26/lifesci-methodology) — skills, frameworks, and reference data for life-science investing

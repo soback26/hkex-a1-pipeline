@@ -4,7 +4,7 @@
 
 A **HKEX A1 pre-IPO life-science tracker**. Monitors every Application Proof filing by Chinese biotech / medtech / healthcare services companies on the Hong Kong Stock Exchange from 2024 onward, including re-filings after 6-month lapses. Output is a single 14-column Excel tracker sorted by filing date descending.
 
-The authoritative methodology for updating this tracker lives in the **`/a1-pipeline-update` skill** at [`soback26/lifesci-methodology`](https://github.com/soback26/lifesci-methodology/blob/main/skills/a1-pipeline-update/SKILL.md). This CLAUDE.md is the repo-local operational guide — it tells Claude Code how to navigate the files, what commit conventions to follow, and which invariants must hold on every save. For anything beyond that, read the skill's `SKILL.md`.
+The canonical Python scraper (`scripts/hkex_scraper.py`, 1500 LOC) and its standalone usage docs (`scripts/README.md`) live in this repo and are the source of truth for HKEX feed fetching, TOC parsing, chapter download, pdfplumber financial extraction, regex sponsor extraction, and the Firecrawl MCP narrative-field schema. The full 5-phase investment workflow that wraps the scraper (Gate 1 candidate approval, Gate 2 diff preview, Phase 5 save invariants) is maintained in a private companion repository — this CLAUDE.md is the public-safe repo-local operational guide covering file layout, commit conventions, and save-time invariants.
 
 ---
 
@@ -20,26 +20,30 @@ hkex-a1-pipeline/
 ├── archive/
 │   └── A1 pipeline_<Mon> <Year>_update_v<N>.xlsx  # Historical monthly snapshots
 ├── raw/                             # Reserved for monthly input files (Mode A)
-└── scripts/                         # Reserved for future automation
+└── scripts/
+    ├── hkex_scraper.py              # Canonical Python scraper (1500 LOC)
+    ├── requirements.txt             # requests / bs4 / pdfplumber / openpyxl
+    └── README.md                    # Python API docs + Firecrawl MCP setup
 ```
 
 **File discipline**:
 - `tracker/a1_pipeline_tracker.xlsx` is the **single live file**. Overwrite on every update; never version-suffix it.
 - `archive/` holds historical snapshots with their original version-suffixed names. Each monthly update drops a copy of the new tracker into `archive/` with the format `A1 pipeline_<Mon> <YYYY>_update_v<N>.xlsx` before overwriting the live file.
 - `raw/` is for Mode A — user drops a monthly Excel with pre-typed new candidate rows (company name + filing date only).
-- `scripts/` is empty today; future Python automation can live here.
+- `scripts/hkex_scraper.py` is the **canonical location** of the Python scraper. Any private workflow that wraps this scraper should `sys.path.insert` into this directory rather than maintaining its own copy. Never duplicate the scraper — single source of truth.
+- `scripts/checkpoints/` (auto-created at runtime, `.gitignore`d) holds transient chapter-PDF downloads. Override via env var `A1_CHECKPOINT_DIR` if you want a different location.
 
 ---
 
 ## Update Workflow
 
-All updates go through the `/a1-pipeline-update` skill. When the user says "update A1 tracker", "A1 update", "scan HKEX for new A1s", or any equivalent, invoke the skill and let it drive the 5-phase pipeline. Do not hand-edit the Excel — every save must pass the skill's Phase 5 invariants (HKEX feed verification, dedup, DESC sort, `dd/mm/yyyy`, Arial 8 black, zero fills).
+All updates go through the private 5-phase skill that wraps `scripts/hkex_scraper.py`. When the user says "update A1 tracker", "A1 update", "scan HKEX for new A1s", or any equivalent, invoke that skill and let it drive the pipeline. Do not hand-edit the Excel — every save must pass the Phase 5 invariants (HKEX feed verification, dedup, DESC sort, `dd/mm/yyyy`, Arial 8 black, zero fills). The scraper module itself is open-source and self-contained in `scripts/`; the investment-workflow wrapper around it is not.
 
 ### Two modes
 
 **Mode A — User provides a pre-typed monthly Excel**: new rows at the top with only D (name) + C (filing date) populated. Skill jumps to Phase 1.
 
-**Mode B — Phase 0 HKEX auto-scraper**: no Excel provided. Skill pulls the HKEX JSON feed, classifies candidates, runs Gate 1 for user approval, downloads SUMMARY/BUSINESS/FINANCIAL chapters, extracts fields via pdfplumber, hands staging rows to Phase 1.
+**Mode B — Phase 0 HKEX auto-scraper**: no Excel provided. Skill pulls the HKEX JSON feed, classifies candidates, runs Gate 1 for user approval, downloads SUMMARY/BUSINESS/FINANCIAL chapters, then extracts fields via a **hybrid pipeline**: `pdfplumber` table parser for cols J/K/L (FY revenue / net income / cash) and regex for col I (sponsor banks) run locally from `hkex_scraper.py`; **Firecrawl MCP (`mcp__firecrawl__scrape` with a JSON schema)** is called on the SUMMARY chapter URL for cols F/G/H/M (shareholder structure / business model / sector / lead asset) because LLM-backed schema extraction is more accurate than regex for prose-heavy semantic fields. Firecrawl requires a free API key from [firecrawl.dev](https://firecrawl.dev) registered at user scope via `claude mcp add firecrawl ...`. Staging rows then flow into Phase 1.
 
 Both modes converge at Phase 4 Gate 2 (mandatory diff preview) and Phase 5 write.
 
@@ -108,7 +112,7 @@ When in doubt, check the prospectus "HISTORY, DEVELOPMENT AND CORPORATE STRUCTUR
 
 ## Save-Time Invariants (Phase 5 Quality Checks)
 
-Every save of `tracker/a1_pipeline_tracker.xlsx` must satisfy all 12 checkboxes below. If any fail, do not save — fix the in-memory state and re-run. The `/a1-pipeline-update` skill enforces these; this list is here so Claude Code in this repo directory can verify them independently when doing any manual touch-up.
+Every save of `tracker/a1_pipeline_tracker.xlsx` must satisfy all 12 checkboxes below. If any fail, do not save — fix the in-memory state and re-run. The private workflow wrapper enforces these; this list is here so Claude Code in this repo directory can verify them independently when doing any manual touch-up.
 
 ### Data-quality checks
 
@@ -158,7 +162,7 @@ In general, **do not hand-edit `tracker/a1_pipeline_tracker.xlsx`** outside the 
 4. Save with a new timestamp in row 1.
 5. Run the 12-item QC checklist against the saved file before committing.
 
-The safer path: invoke `/a1-pipeline-update`, let the skill drive the edit through the 5-phase pipeline, and accept the Gate 2 diff before write.
+The safer path: invoke the private 5-phase workflow wrapper, let it drive the edit through the pipeline, and accept the Gate 2 diff before write.
 
 ---
 
@@ -175,5 +179,4 @@ The safer path: invoke `/a1-pipeline-update`, let the skill drive the edit throu
 
 ## Related Repositories
 
-- [`soback26/lifesci-methodology`](https://github.com/soback26/lifesci-methodology) — skills, frameworks, and reference data for life-science investing. The `/a1-pipeline-update` skill lives at `skills/a1-pipeline-update/SKILL.md` and is the authoritative workflow for this repo.
-- [`soback26/biotech-bd-tracker`](https://github.com/soback26/biotech-bd-tracker) — cross-border out-licensing deal tracker (GC/JP/KR → Western pharma) for royalty sourcing.
+- [`soback26/biotech-bd-tracker`](https://github.com/soback26/biotech-bd-tracker) — cross-border out-licensing deal tracker (GC/JP/KR → Western pharma).
