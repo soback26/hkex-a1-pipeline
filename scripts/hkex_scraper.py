@@ -64,16 +64,19 @@ FIRECRAWL_NARRATIVE_SCHEMA = {
         "shareholder_structure": {
             "type": ["string", "null"],
             "enum": [
-                "H-share", "Red Chip", "VIE",
-                "Cayman holdco", "BVI holdco", None,
+                "H-share", "Red Chip", "VIE", None,
             ],
             "description": (
-                "Corporate structure of the issuer. "
+                "Corporate structure of the issuer. Three values only: "
                 "'H-share' for PRC-domiciled joint stock companies "
-                "(\u80a1\u4efd\u6709\u9650\u516c\u53f8 incorporated in PRC). "
-                "'Red Chip' for offshore holdco without VIE. "
+                "(\u80a1\u4efd\u6709\u9650\u516c\u53f8 incorporated in PRC); "
+                "'Red Chip' for ANY offshore-holdco structure "
+                "(Cayman / BVI / Bermuda) WITHOUT a VIE in the chain; "
                 "'VIE' when a variable interest entity is in the chain. "
-                "'Cayman holdco' / 'BVI holdco' when offshore but not using VIE."
+                "Do NOT return 'Cayman holdco' or 'BVI holdco' \u2014 "
+                "those collapse into 'Red Chip'. The specific incorporation "
+                "jurisdiction (Cayman vs BVI vs Bermuda) is captured in col N "
+                "(Highlights) rather than col F."
             ),
         },
         "business_model": {
@@ -113,11 +116,16 @@ FIRECRAWL_NARRATIVE_PROMPT = (
     "Extract structured fields from this HKEX prospectus chapter. "
     "Return null for any field not clearly stated in the text. "
     "Do not guess. For shareholder_structure, read the Corporate "
-    "Structure / History and Reorganization section carefully and "
-    "distinguish VIE from plain Cayman/BVI holdco. For sector, match "
-    "the issuer's MAIN business, ignoring references to third-party "
-    "suppliers (e.g., a biotech using a CDMO is still 'Pharma / Biotech', "
-    "not 'CDMO')."
+    "Structure / History and Reorganization section carefully and pick "
+    "EXACTLY ONE of three values: 'H-share' (PRC-domiciled 股份有限公司), "
+    "'Red Chip' (offshore Cayman / BVI / Bermuda holdco WITHOUT VIE — the "
+    "only thing you need to detect is whether a variable interest entity / "
+    "可变利益实体 / contractual arrangement controls a PRC OpCo), or 'VIE' "
+    "(a variable interest entity IS in the chain). The narrower 'Cayman "
+    "holdco' / 'BVI holdco' labels are NOT valid outputs — those collapse "
+    "into 'Red Chip'. For sector, match the issuer's MAIN business, "
+    "ignoring references to third-party suppliers (e.g., a biotech using "
+    "a CDMO is still 'Pharma / Biotech', not 'CDMO')."
 )
 
 # F+G robustness tags. One tag per NEW/REFRESH row, surfaced in Phase 4

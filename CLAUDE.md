@@ -79,7 +79,7 @@ Never `git add .` or `git add -A` — enumerate paths explicitly so stray files 
 | C | **Latest A1 Filing** | `datetime` type; `number_format = 'dd/mm/yyyy'`; strictly from HKEX feed |
 | D | **Company Name** | English; suffix `-B` = Ch.18A, `-P` = Ch.18C, no suffix = main board |
 | E | **Chinese Name** | Traditional or simplified |
-| F | **Shareholder Structure** | `H-share` / `Red Chip` / `VIE` / `Cayman holdco` / `BVI holdco` — exactly one, zero blanks |
+| F | **Shareholder Structure** | `H-share` / `Red Chip` / `VIE` — exactly one, zero blanks; specific incorporation jurisdiction (Cayman / BVI / Bermuda) goes in col N as a footnote |
 | G | **Business Model / Clinical Stage** | `<stage>; <one-line description>`; stage ∈ {Commercial-stage, Clinical-stage, Pre-clinical, Commercialized}; zero blanks |
 | H | **Sector** | Pharma / Biotech, MedTech, Services, Diagnostics / Tools, Consumer Health, CDMO, Healthcare Tech |
 | I | **Sponsor** | Joint or sole sponsors; 4+ truncated to top 3 + `et al.` |
@@ -91,13 +91,15 @@ Never `git add .` or `git add -A` — enumerate paths explicitly so stray files 
 
 ### Col F decision rules
 
-- Chinese name ends in `股份有限公司` and company is PRC-domiciled → **H-share**
-- PRC operating business under an offshore holdco, no VIE structure → **Red Chip**
-- Variable interest entity in the corporate chain → **VIE** (even if otherwise Red Chip)
-- Non-PRC operating business (e.g., HK-based retail) under a Cayman-registered holdco → **Cayman holdco**
-- Non-PRC operating business under a BVI-registered holdco → **BVI holdco**
+Three values only — `H-share` | `Red Chip` | `VIE`:
 
-When in doubt, check the prospectus "HISTORY, DEVELOPMENT AND CORPORATE STRUCTURE" chapter. Search keywords: `incorporated in` / `joint stock company` / `股份有限公司` / `Cayman` / `BVI` / `VIE` / `可变利益实体`.
+- Chinese name ends in `股份有限公司` and company is PRC-domiciled → **H-share**
+- Any offshore holdco (Cayman / BVI / Bermuda), no VIE in the chain → **Red Chip**
+- Variable interest entity in the corporate chain → **VIE** (even if otherwise looks like a Red Chip)
+
+Specific incorporation jurisdiction (Cayman vs BVI vs Bermuda) is **not** col F's job — record it in col N (e.g., `Cayman-incorporated parent` or `BVI holdco above PRC OpCo`) when relevant. The older 5-option enum (which separately listed `Cayman holdco` and `BVI holdco`) was retired May 2026 because in HK market practice "Red Chip" already covers all offshore-holdco structures and the parallel labels invited inconsistency (the same company could legitimately be tagged either way).
+
+When in doubt, check the prospectus "HISTORY, DEVELOPMENT AND CORPORATE STRUCTURE" chapter. Search keywords: `incorporated in` / `joint stock company` / `股份有限公司` / `Cayman` / `BVI` / `VIE` / `可变利益实体`. The only call you actually need to make is **VIE vs no-VIE** — everything else routes to H-share (PRC joint stock) or Red Chip (offshore, no VIE) by name pattern.
 
 **Never guess col F or col G**. If the prospectus chapter and a web search both fail to resolve either field, pause and ask the user — do not leave blank, do not make up a value.
 
