@@ -188,6 +188,28 @@ CHAPTER_VARIANTS = {
         "\u5386\u53f2\u8d22\u52a1\u8d44\u6599", "\u6b77\u53f2\u8ca1\u52d9\u8cc7\u6599",
         "\u6703\u8a08\u5e2b\u5831\u544a", "\u4f1a\u8ba1\u5e08\u62a5\u544a",
     ],
+    # PARTIES chapter: holds Sole Sponsor / Joint Sponsor info that the regex
+    # extractor needs for col I. Variants cover both "DIRECTORS AND PARTIES
+    # INVOLVED" (most filings) and "DIRECTORS, SUPERVISORS AND PARTIES INVOLVED"
+    # (A-share dual-listings with PRC supervisor board).
+    "parties": [
+        "directors and parties involved",
+        "directors, supervisors and parties involved",
+        "directors supervisors and parties involved",
+        "parties involved",
+        "\u8463\u4e8b\u53ca\u53c3\u8207\u4eba\u58eb",
+        "\u8463\u4e8b\u3001\u76e3\u4e8b\u53ca\u53c3\u8207\u4eba\u58eb",
+        "\u8463\u4e8b\u3001\u9ad8\u7ba1\u53c3\u8207",
+    ],
+    # HISTORY chapter: Corporate Structure section used by the LLM to confirm
+    # F (H-share / Red Chip / VIE) when SUMMARY alone is ambiguous.
+    "history": [
+        "history, development and corporate structure",
+        "history development and corporate structure",
+        "history and corporate structure",
+        "\u6b77\u53f2\u3001\u767c\u5c55\u53ca\u516c\u53f8\u67b6\u69cb",
+        "\u5386\u53f2\u53d1\u5c55\u4e0e\u516c\u53f8\u67b6\u6784",
+    ],
 }
 
 # Module-global state
@@ -662,13 +684,15 @@ def parse_multi_files_toc(toc_url: str) -> List[Dict[str, str]]:
 def match_target_chapters(
     toc: List[Dict[str, str]],
 ) -> Dict[str, Optional[Dict[str, str]]]:
-    """Pick SUMMARY/BUSINESS/FINANCIAL entries via CHAPTER_VARIANTS matcher.
+    """Pick SUMMARY/BUSINESS/FINANCIAL/PARTIES/HISTORY entries via CHAPTER_VARIANTS.
 
     Uses a two-pass strategy: (1) exact-ish variant match, (2) difflib fuzzy
-    fallback with ratio >= 0.7.
+    fallback with ratio >= 0.7. PARTIES + HISTORY are best-effort: if absent
+    they default to None and downstream extractors handle gracefully.
     """
     out: Dict[str, Optional[Dict[str, str]]] = {
         "summary": None, "business": None, "financial": None,
+        "parties": None, "history": None,
     }
     norm_entries = [(e, _normalize_title(e["title"])) for e in toc]
     for target, variants in CHAPTER_VARIANTS.items():
@@ -739,12 +763,14 @@ def fetch_targeted_chapters(
     """
     candidate.setdefault("qc_flags", [])
     toc_url = candidate.get("multi_files_url")
-    chapter_paths: Dict[str, Optional[str]] = {
-        "summary": None, "business": None, "financial": None,
-    }
-    chapter_urls: Dict[str, Optional[str]] = {
-        "summary": None, "business": None, "financial": None,
-    }
+    # CRITICAL slots = SUMMARY + BUSINESS + FINANCIAL (drive pdf_status).
+    # OPTIONAL slots = PARTIES + HISTORY (sponsor + structure verification);
+    # absence is logged but does not change pdf_status.
+    CRITICAL_SLOTS = ("summary", "business", "financial")
+    OPTIONAL_SLOTS = ("parties", "history")
+    ALL_SLOTS = CRITICAL_SLOTS + OPTIONAL_SLOTS
+    chapter_paths: Dict[str, Optional[str]] = {s: None for s in ALL_SLOTS}
+    chapter_urls: Dict[str, Optional[str]] = {s: None for s in ALL_SLOTS}
     chapter_sizes: Dict[str, int] = {}
     missing: List[str] = []
     pdf_status = "ok"
@@ -757,18 +783,16 @@ def fetch_targeted_chapters(
             candidate["chapter_paths"] = chapter_paths
             candidate["chapter_urls"] = chapter_urls
             candidate["chapter_sizes"] = chapter_sizes
-            candidate["missing_chapters"] = ["summary", "business", "financial"]
+            candidate["missing_chapters"] = list(CRITICAL_SLOTS)
             return candidate
         try:
             full_path = fetch_chapter_pdf(full_url, cache_dir)
-            # We'll treat the full PDF as the source for all three slots; the
-            # extractor is responsible for paginating pdfplumber/Read across it.
-            chapter_paths = {
-                "summary": full_path, "business": full_path, "financial": full_path,
-            }
-            chapter_urls = {
-                "summary": full_url, "business": full_url, "financial": full_url,
-            }
+            # Treat the full PDF as the source for ALL slots; extractors
+            # paginate across it. PARTIES + HISTORY are also routed to the
+            # full PDF — sponsor regex still works on the combined text.
+            for slot in ALL_SLOTS:
+                chapter_paths[slot] = full_path
+                chapter_urls[slot] = full_url
             chapter_sizes = {
                 k: os.path.getsize(full_path) for k in chapter_paths
             }
@@ -792,14 +816,18 @@ def fetch_targeted_chapters(
         candidate["chapter_paths"] = chapter_paths
         candidate["chapter_urls"] = chapter_urls
         candidate["chapter_sizes"] = chapter_sizes
-        candidate["missing_chapters"] = ["summary", "business", "financial"]
+        candidate["missing_chapters"] = list(CRITICAL_SLOTS)
         return candidate
     candidate["toc"] = toc
     picks = match_target_chapters(toc)
-    for slot in ("summary", "business", "financial"):
+    optional_missing: List[str] = []
+    for slot in ALL_SLOTS:
         entry = picks.get(slot)
         if entry is None:
-            missing.append(slot)
+            if slot in CRITICAL_SLOTS:
+                missing.append(slot)
+            else:
+                optional_missing.append(slot)
             continue
         chapter_urls[slot] = entry["url"]
         try:
@@ -808,7 +836,14 @@ def fetch_targeted_chapters(
             chapter_sizes[slot] = os.path.getsize(local)
         except HkexFetchError as e:
             candidate["qc_flags"].append("{}_fetch_failed: {}".format(slot, e))
-            missing.append(slot)
+            if slot in CRITICAL_SLOTS:
+                missing.append(slot)
+            else:
+                optional_missing.append(slot)
+    if optional_missing:
+        candidate["qc_flags"].append(
+            "optional_chapters_missing: " + ",".join(optional_missing)
+        )
     if missing:
         if "summary" in missing and ("business" in missing or "financial" in missing):
             pdf_status = "failed"
@@ -1212,7 +1247,196 @@ def extract_financial_tables_pdfplumber(pdf_path: str) -> Dict[str, Any]:
                     result["confidence"]["revenue"] = "medium"
                     break
 
+    # Sanity check: detect unit-mismatch (e.g., revenue=305m but NI=43199m
+    # would be inconsistent — unit_mult was likely applied to one but not
+    # the other). When all three are populated and any pair differs by >100x
+    # in absolute magnitude, downgrade confidence on the outlier.
+    _sanity_check_unit_consistency(result)
+
     return result
+
+
+# ============================================================================
+# Narrative prose fallback for revenue / NI / cash
+# ============================================================================
+
+# Anchor regex (locate the START of a narrative metric statement)
+# then we scan forward up to 250 chars for ALL "RMB X million" tokens and take
+# the LAST one -- because TRP statements are always written oldest-to-newest:
+#   "In 2023, 2024 and 2025, we recorded revenue of RMB495.9 million,
+#    RMB544.1 million and RMB701.5 million"  -> we want 701.5 (FY25).
+_NARRATIVE_REV_ANCHOR = re.compile(
+    r"(?:total\s+)?revenue\s+(?:of|was|"
+    r"amounted\s+to|increased\s+to|increased\s+by\s+\S+\s+to|"
+    r"of\s+approximately|grew\s+to|reached|"
+    r"declined\s+to|decreased\s+to|dropped\s+to)",
+    re.IGNORECASE,
+)
+# For NI / loss anchor: accept the narrow IFRS forms (preferred) AND broader
+# "loss before tax(ation)" / "loss from operations" since clinical-stage
+# biotechs often disclose losses at those P&L lines. We bias toward the LAST
+# anchor so a paragraph that mentions both "loss from operations 142m" then
+# "loss for the year 191m" picks the latter (which is what we actually want).
+_NARRATIVE_LOSS_ANCHOR = re.compile(
+    r"(?:loss|profit)\s+(?:"
+    r"for\s+the\s+(?:year|period)"
+    r"|attributable"
+    r"|before\s+tax(?:ation)?"
+    r"|from\s+operations"
+    r")",
+    re.IGNORECASE,
+)
+_NARRATIVE_CASH_ANCHOR = re.compile(
+    r"cash\s+and\s+cash\s+equivalents\s+(?:at\s+(?:the\s+)?end\s+of"
+    r"|of\s+approximately|amounted\s+to|was|of\s+|increased\s+to)",
+    re.IGNORECASE,
+)
+# After the anchor: capture all RMB X million tokens in next 250 chars
+_RMB_MILLION_TOKEN = re.compile(
+    r"(?:RMB|HK\$|US\$|USD)\s*([\d,]+(?:\.\d+)?)\s*(million|billion)",
+    re.IGNORECASE,
+)
+
+
+def _is_loss_in_context(text_window: str) -> bool:
+    """Return True if narrative within ±100 chars of match indicates a loss."""
+    return bool(re.search(r"\bloss\b", text_window, re.IGNORECASE))
+
+
+def _extract_last_rmb_value(text_after_anchor: str, max_chars: int = 250) -> Optional[float]:
+    """From a slice starting at a metric anchor, return the LAST RMB X million
+    token converted to RMB millions. Handles 'million' (×1) / 'billion' (×1000).
+    Stops scanning at the first sentence-end (period or newline followed by
+    whitespace OR start of next paragraph), so we don't spill into the next
+    metric's discussion.
+    """
+    slice_text = text_after_anchor[:max_chars]
+    # Truncate at sentence end OR newline-paragraph boundary
+    sent_end = re.search(
+        r"\.(?:\s+[A-Za-z])"      # period + space + any letter (sentence)
+        r"|(?:\.\s*\n)"             # period + newline (sentence break)
+        r"|(?:\n\s*\n)"             # blank line (paragraph break)
+        r"|(?:\n[A-Z])"             # newline + capital (new paragraph header)
+        r"|(?:respectively\.)",     # explicit list-end marker
+        slice_text,
+    )
+    if sent_end:
+        slice_text = slice_text[: sent_end.start() + 1]
+    matches = list(_RMB_MILLION_TOKEN.finditer(slice_text))
+    if not matches:
+        return None
+    last = matches[-1]
+    try:
+        v = float(last.group(1).replace(",", ""))
+        unit = last.group(2).lower()
+        if unit.startswith("billion"):
+            v *= 1000.0
+        return v
+    except ValueError:
+        return None
+
+
+def extract_financials_from_narrative(text: str) -> Dict[str, Any]:
+    """Extract J/K/L from prose narrative when table extraction fails.
+
+    Targets statements like:
+      - "In 2023, 2024 and 2025, we recorded total revenue of RMB495.9 million,
+         RMB544.1 million and RMB701.5 million" -> 701.5 (last/most-recent)
+      - "loss for the year was RMB163.8 million and RMB191.4 million" -> -191.4
+      - "cash and cash equivalents at end of year amounted to RMB268.7 million"
+        -> 268.7
+
+    Returns the same shape as extract_financial_tables_pdfplumber. All values
+    in RMB millions (anchor regex requires 'million'/'billion' suffix; billion
+    auto-converts to millions).
+    """
+    result: Dict[str, Any] = {
+        "revenue_m": None, "net_income_m": None, "cash_m": None,
+        "fy_label": None, "currency": "RMB",
+        "source_pages": {}, "confidence": {}, "raw_hits": [],
+    }
+    if not text:
+        return result
+
+    cleaned = _clean_page_text(text)
+
+    # Revenue: find LAST anchor (latest narrative paragraph) and take LAST
+    # RMB-million token after it
+    rev_anchors = list(_NARRATIVE_REV_ANCHOR.finditer(cleaned))
+    if rev_anchors:
+        anchor = rev_anchors[-1]
+        v = _extract_last_rmb_value(cleaned[anchor.end():])
+        if v is not None:
+            result["revenue_m"] = v
+            result["confidence"]["revenue"] = "medium"
+            result["source_pages"]["revenue"] = -1
+            result["raw_hits"].append({
+                "metric": "revenue", "page": -1,
+                "line": cleaned[max(0, anchor.start() - 20): anchor.end() + 200][:300],
+            })
+
+    # Net income / loss
+    pl_anchors = list(_NARRATIVE_LOSS_ANCHOR.finditer(cleaned))
+    if pl_anchors:
+        anchor = pl_anchors[-1]
+        v = _extract_last_rmb_value(cleaned[anchor.end():])
+        if v is not None:
+            ctx = cleaned[max(0, anchor.start() - 100): anchor.end() + 250]
+            if _is_loss_in_context(ctx):
+                v = -abs(v)
+            result["net_income_m"] = v
+            result["confidence"]["net_income"] = "medium"
+            result["source_pages"]["net_income"] = -1
+            result["raw_hits"].append({
+                "metric": "net_income", "page": -1,
+                "line": ctx[:300],
+            })
+
+    # Cash
+    cash_anchors = list(_NARRATIVE_CASH_ANCHOR.finditer(cleaned))
+    if cash_anchors:
+        anchor = cash_anchors[-1]
+        v = _extract_last_rmb_value(cleaned[anchor.end():])
+        if v is not None:
+            result["cash_m"] = v
+            result["confidence"]["cash"] = "medium"
+            result["source_pages"]["cash"] = -1
+            result["raw_hits"].append({
+                "metric": "cash", "page": -1,
+                "line": cleaned[max(0, anchor.start() - 20): anchor.end() + 100][:200],
+            })
+
+    return result
+
+
+def _sanity_check_unit_consistency(result: Dict[str, Any]) -> None:
+    """Flag unit-mismatch when J/K/L magnitudes are inconsistent.
+
+    HKEX prospectuses always report revenue/NI/cash in the same unit (RMB'000
+    or RMB millions). If after unit-mult application revenue=305m but NI=43199
+    (i.e., NI is ~140x larger), the unit_mult was applied to revenue but not
+    NI — most likely the NI value came from a different page with different
+    unit metadata. Downgrade confidence on the outlier so Phase 4 surfaces it.
+    """
+    j = result.get("revenue_m")
+    k = result.get("net_income_m")
+    l = result.get("cash_m")
+    nums = [(name, abs(v)) for name, v in
+            (("revenue", j), ("net_income", k), ("cash", l))
+            if isinstance(v, (int, float)) and v != 0]
+    if len(nums) < 2:
+        return
+    # If any pair differs by >500x, flag the largest as suspect
+    nums.sort(key=lambda x: x[1])
+    smallest = nums[0][1]
+    for name, v in nums[1:]:
+        if smallest > 0 and v / smallest > 500:
+            existing = result["confidence"].get(name, "high")
+            if existing != "low":
+                result["confidence"][name] = "low"
+                result.setdefault("sanity_flags", []).append(
+                    "{}_unit_mismatch:{:.1f}x_vs_smallest".format(name, v / smallest)
+                )
 
 
 # ============================================================================
@@ -1234,25 +1458,105 @@ def _extract_chapter_text(pdf_path: str, max_pages: int = 10) -> str:
     return "\n".join(parts)
 
 
-def _extract_col_I_sponsor(summary_text: str) -> Optional[str]:
-    """Pull sponsor bank names from Summary / 'Directors and Parties Involved' sections."""
-    if not summary_text:
+# Known sponsor-bank names/aliases. Used to map a free-text sponsor block to
+# a canonical short label set (e.g., "China International Capital Corporation
+# Hong Kong Securities Limited" → "CICC"). Order matters for substring matching.
+_SPONSOR_BANK_ALIASES: List[Tuple[str, str]] = [
+    ("china international capital corporation", "CICC"),
+    ("china merchants securities (hk)", "CMS HK"),
+    ("china merchants securities", "CMS HK"),
+    ("merrill lynch", "BAML"),
+    ("bofa securities", "BAML"),
+    ("bank of america", "BAML"),
+    ("ccb international", "CCBI"),
+    ("citic securities", "CITIC"),
+    ("guotai junan", "Guotai Junan"),
+    ("guotai capital", "Guotai Junan"),
+    ("haitong international", "Haitong"),
+    ("huatai financial", "Huatai"),
+    ("huatai securities", "Huatai"),
+    ("jefferies", "Jefferies"),
+    ("morgan stanley", "Morgan Stanley"),
+    ("goldman sachs", "Goldman Sachs"),
+    ("ubs", "UBS"),
+    ("credit suisse", "CS"),
+    ("nomura", "Nomura"),
+    ("daiwa", "Daiwa"),
+    ("gf capital", "GF Capital"),
+    ("gf securities", "GF Capital"),
+    ("abci capital", "ABCI"),
+    ("icbc international", "ICBCI"),
+    ("boci asia", "BOCI"),
+    ("boc international", "BOCI"),
+    ("clsa limited", "CLSA"),
+    ("hsbc", "HSBC"),
+    ("standard chartered", "StanChart"),
+    ("deutsche bank", "DB"),
+]
+
+
+def _normalize_sponsor_block(text: str) -> str:
+    """Map a sponsor block text to a comma-separated canonical-alias string.
+
+    Falls back to the trimmed raw text when no known aliases match.
+    """
+    if not text:
+        return ""
+    found: List[str] = []
+    text_lower = text.lower()
+    for needle, alias in _SPONSOR_BANK_ALIASES:
+        if needle in text_lower and alias not in found:
+            found.append(alias)
+    if found:
+        return ", ".join(found)
+    # Fallback: trim raw text to first comma/parenthesis
+    cleaned = re.sub(r"\s+", " ", text).strip(" .;:,")
+    for end in [". The", "\n", "and (the", "(Act", "(the", "in its", "in their"]:
+        if end in cleaned:
+            cleaned = cleaned.split(end)[0]
+    return cleaned[:200]
+
+
+def _extract_col_I_sponsor(parties_text: str) -> Optional[str]:
+    """Pull sponsor bank names from the PARTIES INVOLVED section.
+
+    Note: pre-May-2026 versions of this function read the SUMMARY chapter, but
+    sponsor info is consistently in 'DIRECTORS AND PARTIES INVOLVED' (or its
+    A-share variant 'DIRECTORS, SUPERVISORS AND PARTIES INVOLVED'). When no
+    PARTIES chapter is available (rare — TOC missing or full PDF fallback),
+    the caller should pass the full SUMMARY text and the patterns below will
+    still fire on any 'Sole/Joint Sponsor:' label they happen to find.
+    """
+    if not parties_text:
         return None
+    # Look for sponsor section header followed by 1500 chars of bank listings.
+    # The PARTIES chapter has structure: "PARTIES INVOLVED IN THE [REDACTED]\n
+    # Sole Sponsor   <bank A>\n   <address>\nLegal advisers..." — we want the
+    # block between "Sole Sponsor"/"Joint Sponsor(s)" and "Legal advis".
+    section_re = re.compile(
+        r"(?:Sole\s+Sponsor|Joint\s+Sponsors?(?:\s*,\s*Sponsor-OCs?)?|Sponsor-OCs?)"
+        r"[\s\.,:]{0,40}([\s\S]{20,2000}?)"
+        r"(?=Legal\s+Advis|Reporting\s+Accountant|Compliance\s+Adviser|–\s*\d+\s*–|$)",
+        re.IGNORECASE,
+    )
+    m = section_re.search(parties_text)
+    if m:
+        block = m.group(1)
+        normalized = _normalize_sponsor_block(block)
+        if normalized:
+            return normalized
+    # Single-line fallback (older/simpler templates)
     patterns = [
         r"Sole\s+Sponsor[\s:\.]*(?:\([^)]+\))?[\s:\.]*([^\n]{5,300})",
         r"Joint\s+Sponsors?[\s:\.]*(?:\([^)]+\))?[\s:\.]*([^\n]{5,300})",
         r"Sponsor\(s\)[\s:\.]*([^\n]{5,300})",
     ]
     for p in patterns:
-        m = re.search(p, summary_text, re.IGNORECASE)
+        m = re.search(p, parties_text, re.IGNORECASE)
         if m:
-            candidate = m.group(1).strip()
-            for end in [". The", "\n", "and (the", "(Act", "(the", "in its", "in their"]:
-                if end in candidate:
-                    candidate = candidate.split(end)[0]
-            candidate = re.sub(r"\s+", " ", candidate).strip(" .;:,")
-            if 5 <= len(candidate) <= 200:
-                return candidate
+            normalized = _normalize_sponsor_block(m.group(1))
+            if normalized and 3 <= len(normalized) <= 200:
+                return normalized
     return None
 
 
@@ -1295,9 +1599,18 @@ def extract_fields_from_chapters(
     paths = candidate.get("chapter_paths") or {}
     summary_path = paths.get("summary")
     financial_path = paths.get("financial")
+    parties_path = paths.get("parties")
 
-    # Regex-based sponsor extraction still runs on pdfplumber SUMMARY text.
-    summary_text = _extract_chapter_text(summary_path, max_pages=10) if summary_path else ""
+    # Regex-based sponsor extraction now reads the PARTIES chapter (where
+    # sponsor info actually lives). Falls back to SUMMARY only if PARTIES is
+    # missing — older code path which we keep as a safety net but expect to
+    # rarely fire.
+    parties_text = (
+        _extract_chapter_text(parties_path, max_pages=8) if parties_path else ""
+    )
+    summary_text = (
+        _extract_chapter_text(summary_path, max_pages=10) if summary_path else ""
+    )
 
     # F/G/H/M: deferred to Firecrawl (apply_firecrawl_narrative).
     for col in ("F", "G", "H", "M"):
@@ -1306,12 +1619,23 @@ def extract_fields_from_chapters(
         confidence[col] = "low"
         qc_flags.append("firecrawl_pending_col_{}".format(col))
 
-    # I: sponsor via regex on SUMMARY.
-    row_draft["I"] = _extract_col_I_sponsor(summary_text)
-    provenance["I"] = "pdfplumber:SUMMARY"
+    # I: sponsor via regex on PARTIES (preferred) or SUMMARY fallback.
+    sponsor_source = "PARTIES" if parties_text else "SUMMARY"
+    sponsor_text = parties_text or summary_text
+    row_draft["I"] = _extract_col_I_sponsor(sponsor_text)
+    provenance["I"] = "pdfplumber:{}".format(sponsor_source)
     confidence["I"] = "medium" if row_draft["I"] else "low"
+    if not row_draft["I"]:
+        qc_flags.append("sponsor_extraction_failed")
 
-    # J/K/L: deterministic pdfplumber table parsing on FINANCIAL chapter.
+    # J/K/L: 3-tier extraction strategy.
+    #   Tier 1 -- pdfplumber.extract_tables() on FINANCIAL chapter (clean tables)
+    #   Tier 2 -- text-based sliding window on FINANCIAL (fallback for visual tables)
+    #   Tier 3 -- narrative prose extraction on SUMMARY chapter (rescue when
+    #             tier 1 + 2 return wrong values due to dotted-leader / cid:2
+    #             artifacts; SUMMARY's "Our Financial Performance" narrative
+    #             section explicitly says "we recorded total revenue of RMB X
+    #             million" which is unambiguous)
     fin_fy_label = ""
     if financial_path:
         fin = extract_financial_tables_pdfplumber(financial_path)
@@ -1327,6 +1651,35 @@ def extract_fields_from_chapters(
         confidence["K"] = fin_conf.get("net_income", "low")
         confidence["L"] = fin_conf.get("cash", "low")
         fin_fy_label = fin.get("fy_label") or ""
+        if fin.get("sanity_flags"):
+            qc_flags.extend(fin["sanity_flags"])
+
+        # Tier 3: narrative-prose rescue. Triggers when any J/K/L is None OR
+        # has confidence='low'. Reads SUMMARY chapter "Our Financial
+        # Performance" / "OVERVIEW" section.
+        needs_rescue = (
+            row_draft["J"] in (None, "-")
+            or row_draft["K"] is None
+            or row_draft["L"] is None
+            or confidence["J"] == "low"
+            or confidence["K"] == "low"
+            or confidence["L"] == "low"
+        )
+        if needs_rescue and summary_text:
+            narr = extract_financials_from_narrative(summary_text)
+            for col, key in (("J", "revenue_m"), ("K", "net_income_m"), ("L", "cash_m")):
+                narr_val = narr.get(key)
+                cur_val = row_draft[col]
+                cur_conf = confidence[col]
+                # Only overwrite when narrative confidence is medium AND
+                # current is None or low-confidence
+                if (narr_val is not None
+                        and (cur_val is None
+                             or (col == "J" and cur_val == "-")
+                             or cur_conf == "low")):
+                    row_draft[col] = narr_val
+                    provenance[col] = "narrative:SUMMARY"
+                    confidence[col] = narr.get("confidence", {}).get(key, "medium")
     else:
         row_draft["J"] = row_draft["K"] = row_draft["L"] = None
         provenance["J"] = provenance["K"] = provenance["L"] = "missing"
@@ -1690,3 +2043,350 @@ if __name__ == "__main__":
         print("Warnings:")
         for w in warnings_log:
             print("  - {}".format(w))
+
+
+# ============================================================================
+# Master diff (#3) -- detect stale master cells against fresh extraction
+# ============================================================================
+
+# Cols that can drift (sponsor change, asset rename, sector reclass, etc.) and
+# are worth comparing master vs extracted. Skip C (always refreshed) and N
+# (always rewritten) and the financial cols J/K/L (refresh contract handles).
+_DIFF_COMPARABLE_COLS = ("F", "G", "H", "I", "M")
+
+
+def _normalize_for_compare(s: Any) -> str:
+    """Lowercase, strip whitespace, drop punctuation noise for delta detection."""
+    if s is None:
+        return ""
+    if not isinstance(s, str):
+        s = str(s)
+    s = s.lower()
+    s = re.sub(r"[^\w一-鿿\s]+", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def diff_against_master(
+    staging_row: Dict[str, Any],
+    master_row: Dict[str, Any],
+    cols: Tuple[str, ...] = _DIFF_COMPARABLE_COLS,
+) -> List[Dict[str, Any]]:
+    """Compare extracted row_draft against master cells; surface deltas.
+
+    Used in Phase 4 (Gate 2) to flag potentially-stale master values that the
+    REFRESH pipeline would otherwise preserve under the "only fill blanks" rule.
+    Each delta becomes a user-decision item: keep master / take extracted /
+    skip review.
+
+    Args:
+        staging_row: dict with 'row_draft' key (output of
+                     extract_fields_from_chapters + apply_firecrawl_narrative).
+        master_row : dict keyed by col letter (output of load_master_tracker
+                     with the matched row pulled out).
+        cols       : which cols to compare (default: F, G, H, I, M).
+
+    Returns:
+        list of {"col": "M", "master": <old>, "extracted": <new>,
+                 "decision": "pending"} dicts -- one per non-trivial delta.
+        Empty list when nothing diverges.
+    """
+    row_draft = staging_row.get("row_draft", {})
+    deltas: List[Dict[str, Any]] = []
+    for col in cols:
+        master_val = master_row.get(col)
+        extracted_val = row_draft.get(col)
+        # Skip when either side is empty (fill-if-empty already handles this)
+        if not master_val or not extracted_val:
+            continue
+        # Skip when normalized strings match (semantically same)
+        if _normalize_for_compare(master_val) == _normalize_for_compare(extracted_val):
+            continue
+        # Skip if extracted is a strict prefix/suffix of master (the longer
+        # string is just more detailed -- not a contradiction)
+        m_norm = _normalize_for_compare(master_val)
+        e_norm = _normalize_for_compare(extracted_val)
+        if m_norm in e_norm or e_norm in m_norm:
+            # One is a substring of the other -- prefer the longer one but
+            # flag for awareness (analyst may want to take the longer one)
+            if len(e_norm) > len(m_norm) * 1.3:
+                deltas.append({
+                    "col": col,
+                    "master": str(master_val)[:200],
+                    "extracted": str(extracted_val)[:200],
+                    "kind": "extracted_more_detailed",
+                    "decision": "pending",
+                })
+            continue
+        deltas.append({
+            "col": col,
+            "master": str(master_val)[:200],
+            "extracted": str(extracted_val)[:200],
+            "kind": "divergent",
+            "decision": "pending",
+        })
+    return deltas
+
+
+# ============================================================================
+# LLM relevance check (#4) -- detect rebrand-out-of-LS candidates (Wanchen-style)
+# ============================================================================
+
+# Schema for Firecrawl-backed LS relevance verification. The skill driver
+# passes this verbatim to mcp__firecrawl__firecrawl_scrape jsonOptions for the
+# Multi-Files INDEX page (NOT a chapter PDF; the index is HTML and Firecrawl
+# scrapes it cleanly). For each pre-filter-passing candidate the LLM returns
+# whether the company's CURRENT business (not legacy name) is in life sciences.
+LLM_RELEVANCE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "is_lifesci": {
+            "type": "boolean",
+            "description": (
+                "True if the company's CURRENT main business is in life "
+                "sciences (pharma, biotech, medtech, diagnostics, vaccines, "
+                "TCM, healthcare services, healthcare tech, consumer health, "
+                "CDMO/CXO). False if they have rebranded out of LS (e.g., "
+                "Wanchen rebranded from Wanchen Biotechnology to Wanchen Food "
+                "Group -- legacy name has 'biotech' but current business is "
+                "frozen food)."
+            ),
+        },
+        "current_business": {
+            "type": "string",
+            "description": "One-sentence description of the issuer's CURRENT main business.",
+        },
+        "rebrand_concern": {
+            "type": "boolean",
+            "description": (
+                "True if the company has rebranded / pivoted out of life "
+                "sciences (legacy name suggests LS but current business does "
+                "not). False otherwise."
+            ),
+        },
+    },
+    "required": ["is_lifesci", "current_business", "rebrand_concern"],
+}
+
+LLM_RELEVANCE_PROMPT = (
+    "Look at this HKEX Application Proof Multi-Files index page (the "
+    "company name + chapter list). Determine whether this issuer's CURRENT "
+    "main business is in life sciences. Watch for rebranded entities -- if "
+    "the English name says e.g. 'XYZ Food Group (formerly known as XYZ "
+    "Biotechnology Group)', the CURRENT business is FOOD, not biotech, so "
+    "is_lifesci=false and rebrand_concern=true. Be conservative: only return "
+    "is_lifesci=true when life sciences is unambiguously the main business."
+)
+
+
+def apply_llm_relevance(
+    candidate: Dict[str, Any],
+    relevance_data: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Merge LLM relevance check result into a candidate dict.
+
+    Mutates candidate in place. Adds:
+      - candidate['llm_relevance'] = relevance_data (the raw LLM dict)
+      - candidate['qc_flags'] += relevant tags
+      - if rebrand_concern=True or is_lifesci=False -> sets
+        candidate['llm_downgrade_reason'] for the Phase 0 Gate 1 renderer
+        to surface in the LLM DOWNGRADED bucket.
+    """
+    candidate.setdefault("qc_flags", [])
+    candidate["llm_relevance"] = relevance_data or {}
+    if not isinstance(relevance_data, dict):
+        return candidate
+    is_ls = relevance_data.get("is_lifesci")
+    rebrand = relevance_data.get("rebrand_concern")
+    current = relevance_data.get("current_business", "")[:120]
+    if is_ls is False or rebrand is True:
+        reason = "rebranded out of LS" if rebrand else "LLM says not life-sciences"
+        candidate["llm_downgrade_reason"] = "{}: {}".format(reason, current)
+        candidate["qc_flags"].append("llm_downgrade_candidate")
+    return candidate
+
+
+# ============================================================================
+# Extraction Health Dashboard (#7) -- aggregate extraction success per col
+# ============================================================================
+
+def compute_extraction_health(staging_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Aggregate per-column extraction success across staging rows.
+
+    Returns a dict suitable for rendering in the Phase 4 Gate 2 diff:
+      {
+        "n_rows": int,
+        "by_col": {
+          "F": {"success": int, "low_conf": int, "blank": int, "rate": float},
+          ...
+        },
+        "abort_recommended": bool,        # any col < 50% success
+        "block_cols": List[str],          # cols below 50% threshold
+      }
+
+    A cell is "success" if row_draft[col] is non-empty AND confidence is not
+    "low" AND no firecrawl_pending flag exists for that col.
+    """
+    cols = ("F", "G", "H", "I", "J", "K", "L", "M")
+    out: Dict[str, Any] = {"n_rows": len(staging_rows), "by_col": {}}
+    if not staging_rows:
+        out["abort_recommended"] = False
+        out["block_cols"] = []
+        return out
+    block_cols: List[str] = []
+    for col in cols:
+        success = 0
+        low_conf = 0
+        blank = 0
+        for row in staging_rows:
+            rd = row.get("row_draft", {})
+            conf = (row.get("_confidence") or {}).get(col, "low")
+            qc = row.get("_qc_flags", [])
+            v = rd.get(col)
+            pending_flag = "firecrawl_pending_col_{}".format(col)
+            is_pending = pending_flag in qc
+            if v is None or v == "" or is_pending:
+                blank += 1
+                continue
+            if conf == "low":
+                low_conf += 1
+                continue
+            success += 1
+        n = len(staging_rows)
+        rate = success / n if n else 0.0
+        out["by_col"][col] = {
+            "success": success,
+            "low_conf": low_conf,
+            "blank": blank,
+            "rate": round(rate, 3),
+        }
+        if rate < 0.5:
+            block_cols.append(col)
+    out["block_cols"] = block_cols
+    out["abort_recommended"] = bool(block_cols)
+    return out
+
+
+def render_extraction_health(health: Dict[str, Any]) -> str:
+    """Format compute_extraction_health output for Gate 2 console output."""
+    lines = ["=== Extraction Health (NEW + REFRESH being written) ==="]
+    n = health.get("n_rows", 0)
+    if n == 0:
+        return "\n".join(lines + ["  (no rows)"])
+    col_labels = {
+        "F": "F (structure)", "G": "G (business)", "H": "H (sector)",
+        "I": "I (sponsor)", "J": "J (revenue)", "K": "K (NI)",
+        "L": "L (cash)", "M": "M (lead asset)",
+    }
+    for col, info in health.get("by_col", {}).items():
+        s = info["success"]
+        lc = info["low_conf"]
+        b = info["blank"]
+        rate = info["rate"]
+        if rate >= 0.9:
+            mark = "OK "
+        elif rate >= 0.5:
+            mark = "WARN"
+        else:
+            mark = "FAIL"
+        suffix = ""
+        if lc > 0:
+            suffix += "  ({} low-conf)".format(lc)
+        if b > 0:
+            suffix += "  ({} blank)".format(b)
+        lines.append(
+            "  {:6s} {}/{}  {:3.0f}%  {}{}".format(
+                mark, s, n, rate * 100, col_labels.get(col, col), suffix
+            )
+        )
+    if health.get("abort_recommended"):
+        lines.append("")
+        lines.append("  >> ABORT RECOMMENDED: cols {} below 50% success.".format(
+            ", ".join(health["block_cols"])
+        ))
+        lines.append("     Investigate root cause before Phase 5 write.")
+    return "\n".join(lines)
+
+
+# ============================================================================
+# Col B status lifecycle (#5) -- compute "Expiring in N month" / "Expired"
+# ============================================================================
+
+def compute_status(
+    filing_date: Any,
+    today: Optional[datetime.date] = None,
+    validity_months: int = 6,
+) -> Optional[str]:
+    """Compute col B status based on filing date and HKEX 6-month validity.
+
+    HKEX Application Proof has a 6-month validity window. Status semantics:
+      - 0-3 months since filing: None (fresh, no marker)
+      - 4-5 months since filing: 'Expiring in 2 month' / 'Expiring in 1 month'
+      - >= 6 months: 'Expired' (caller should also append † to col D for Expired
+                     rows, but this function returns only the status text)
+    Returns None when filing_date is unparseable.
+
+    Used during REFRESH (where the filing date just changed -> status resets
+    to None) and during a periodic refresh of all rows in the master.
+    """
+    if filing_date is None:
+        return None
+    if isinstance(filing_date, datetime.datetime):
+        fd = filing_date.date()
+    elif isinstance(filing_date, datetime.date):
+        fd = filing_date
+    else:
+        try:
+            fd = datetime.datetime.strptime(
+                str(filing_date)[:10], "%Y-%m-%d"
+            ).date()
+        except ValueError:
+            return None
+    if today is None:
+        today = datetime.date.today()
+    days_since = (today - fd).days
+    months_since = days_since // 30
+    months_remaining = validity_months - months_since
+    if months_remaining <= 0:
+        return "Expired"
+    if months_remaining <= 2:
+        return "Expiring in {} month".format(months_remaining)
+    return None
+
+
+# ============================================================================
+# Col F enum schema check (#6) -- validate before Phase 5 write
+# ============================================================================
+
+VALID_COL_F_VALUES = ("H-share", "Red Chip", "VIE")
+
+
+def validate_col_f_value(value: Any) -> Tuple[bool, Optional[str]]:
+    """Validate a col F value against the post-May-2026 3-option enum.
+
+    Returns:
+      (is_valid: bool, suggested_replacement: Optional[str])
+      - ('H-share', None)               -> valid, no migration needed
+      - (False, 'Red Chip')              -> 'Cayman holdco' / 'BVI holdco' map to 'Red Chip'
+      - (False, None)                    -> unknown value, manual review needed
+
+    Used by Phase 5 pre-write QC AND by scripts/migrate_col_f_v2.py.
+    """
+    if value is None or value == "":
+        return (False, None)
+    s = str(value).strip()
+    if s in VALID_COL_F_VALUES:
+        return (True, None)
+    # Legacy v1 enum -> migration mapping
+    if s in ("Cayman holdco", "BVI holdco", "Bermuda holdco"):
+        return (False, "Red Chip")
+    # Common typos / casing
+    s_lower = s.lower().replace("-", "").replace(" ", "")
+    if s_lower in ("hshare", "hshares"):
+        return (False, "H-share")
+    if s_lower in ("redchip", "redchips"):
+        return (False, "Red Chip")
+    if s_lower == "vie":
+        return (False, "VIE")
+    return (False, None)
+

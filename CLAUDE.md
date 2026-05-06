@@ -75,7 +75,7 @@ Never `git add .` or `git add -A` — enumerate paths explicitly so stray files 
 | # | Column | Format |
 |---|---|---|
 | A | **Timestamp** | `"Updated as of <Mon D, YYYY>"` — row 1 only, refreshed on every save |
-| B | **Status** | Free-text marker, e.g., `Expiring in 1 month`. Replaces the legacy highlighted-row scheme. |
+| B | **Status** | Lifecycle marker computed from filing_date via `hs.compute_status()` — see "Col B lifecycle" below. Replaces the legacy highlighted-row scheme. |
 | C | **Latest A1 Filing** | `datetime` type; `number_format = 'dd/mm/yyyy'`; strictly from HKEX feed |
 | D | **Company Name** | English; suffix `-B` = Ch.18A, `-P` = Ch.18C, no suffix = main board |
 | E | **Chinese Name** | Traditional or simplified |
@@ -102,6 +102,30 @@ Specific incorporation jurisdiction (Cayman vs BVI vs Bermuda) is **not** col F'
 When in doubt, check the prospectus "HISTORY, DEVELOPMENT AND CORPORATE STRUCTURE" chapter. Search keywords: `incorporated in` / `joint stock company` / `股份有限公司` / `Cayman` / `BVI` / `VIE` / `可变利益实体`. The only call you actually need to make is **VIE vs no-VIE** — everything else routes to H-share (PRC joint stock) or Red Chip (offshore, no VIE) by name pattern.
 
 **Never guess col F or col G**. If the prospectus chapter and a web search both fail to resolve either field, pause and ask the user — do not leave blank, do not make up a value.
+
+### Col B lifecycle
+
+Computed every save from `filing_date` (col C) and `today` via `hs.compute_status()`:
+
+| Months since filing | Col B value |
+|---|---|
+| 0 – 3 months | `None` (cleared, fresh) |
+| 4 months | `"Expiring in 2 month"` |
+| 5 months | `"Expiring in 1 month"` |
+| ≥ 6 months | `"Expired"` (and append `†` to col D for Expired rows) |
+
+HKEX A1 Application Proof has a 6-month validity window; after that the issuer must either re-file or withdraw. On REFRESH (new filing), B resets to `None` because the new filing_date restarts the countdown. On periodic monthly runs, all rows get re-stamped against the current `today`. Do NOT preserve master col B values across saves — they're stale by definition once filing_date or today changes.
+
+### Col F enum migration (May 2026)
+
+The `Cayman holdco` / `BVI holdco` enum values were retired. To migrate an old tracker:
+
+```bash
+python3 scripts/migrate_col_f_v2.py            # dry run -- shows what would change
+python3 scripts/migrate_col_f_v2.py --apply    # write back, with auto-snapshot
+```
+
+The script rewrites legacy F values to `Red Chip` and appends `[Cayman-incorporated]` / `[BVI-incorporated]` to col N as a jurisdiction footnote. Phase 5 also calls `hs.validate_col_f_value()` on every row before save, blocking any unknown F values.
 
 ### Col G format rules
 

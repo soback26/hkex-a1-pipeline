@@ -78,22 +78,27 @@ Phase 0 produces an in-memory list of `staging_row` dicts that Phase 1 consumes 
 - `include_gem`: `bool`, default `False`
 - `target_fy`: inherited from skill-level default (FY25)
 
-### Phase 0 workflow (10 steps)
+### Phase 0 workflow (11 steps)
 
 1. **Sanity import** — `import requests, bs4, pdfplumber, openpyxl, pandas`. On `ImportError` print missing lib and stop.
 2. **Fetch JSON feeds** — `fetch_hkex_feed(year, lang="en")` and `..."c"` from `https://www1.hkexnews.hk/ncms/json/eds/app_{YYYY}_sehk_{e|c}.json`. Keep records whose `ls` has `nF` starting with `"Application Proof"`. Join EN+CN by `id`.
 3. **Keyword pre-filter** — `filter_candidates(...)`: EN keyword OR CN keyword OR `-B`/`-P` suffix match. Typical hit rate ~22% (58/265 on 2026 SEHK).
 4. **Load master tracker** — read-only via `openpyxl.load_workbook(..., data_only=True)`. Handles mixed `datetime`/`str` dates in col C; `†` lapsed markers; drifted sector vocab.
 5. **Classify candidates** — `classify_candidates(...)` buckets into NEW / REFRESH / SKIP. Duplicate master rows (e.g., Sirius r6 + r92) pick the most recent and annotate `multi_row_match` QC flag.
-6. **GATE 1** — render the candidate list below and WAIT for user approval. No PDFs fetched until approval.
-7. **Create cache dir** — `create_cache_dir()` under `checkpoints/YYYY-MM-DD_a1_hkex_pdfs/` (with `_2`/`_3` suffix on collision from aborted prior run).
-8. **Per-approved-candidate extraction loop** — for each candidate, run the following three sub-steps in order:
-   - **(8a)** `fetch_targeted_chapters(cand, cache_dir)` — parse Multi-Files TOC, match SUMMARY/BUSINESS/FINANCIAL, download the three chapter PDFs (~5 MB total per candidate). Also populates `cand['chapter_urls']` with the remote URLs for each slot — Firecrawl needs these in step 8c.
-   - **(8b)** `staging_row = extract_fields_from_chapters(cand, target_fy=target_fy)` — pdfplumber table parser on FINANCIAL for J/K/L, regex on pdfplumber SUMMARY text for I (sponsor), assembled col N with FY marker. **Leaves F/G/H/M as `None`** and tags the row with `firecrawl_pending_col_F/G/H/M` QC flags. This step is deterministic, offline, and cheap — if Firecrawl is unavailable for any reason, the skill can still proceed to Phase 4 and let the user fill F/G/H/M manually.
-   - **(8c)** **Firecrawl narrative extraction for F/G/H/M** — invoke `mcp__firecrawl__scrape` on the candidate's SUMMARY chapter URL (from `cand['chapter_urls']['summary']`) with `formats=["json"]` and `jsonOptions={"schema": hs.FIRECRAWL_NARRATIVE_SCHEMA, "prompt": hs.FIRECRAWL_NARRATIVE_PROMPT}`. The MCP call returns a dict under `.json` with keys `shareholder_structure / business_model / sector / lead_asset`. Pass that dict to `hs.apply_firecrawl_narrative(staging_row, fc_data)` which maps it onto F/G/H/M, sets provenance to `firecrawl:SUMMARY`, sets confidence to `high`, and clears the pending QC flags for any field that came back non-null. Fields Firecrawl returned null for remain as `None` + pending flag — Phase 4 will surface them for manual fill. See [Firecrawl MCP Integration](#firecrawl-mcp-integration-cols-fghm) for schema/prompt details, cost, and fallback behavior.
-   - **(8d)** **Robustness tag classification** — after `apply_firecrawl_narrative()` returns, call `hs.auto_classify_fg_robustness(staging_row)` to assign a Phase-0-determinable F+G robustness tag (one of `verified_fg_prospectus` / `single_source_prospectus_fg` / `not_found_fg` — see [Robustness Tag Vocabulary](#robustness-tag-vocabulary) below). The function reads `_provenance` / `_confidence` / `row_draft` for cols F and G and mutates the staging row in place, appending the chosen tag to `_qc_flags` and the canonical suffix to `row_draft["N"]`. The web-fallback tags (`web_cross_checked_fg` / `single_source_family_fg` / `conflicting_fg`) cannot be auto-determined from Python state — they're set by the agent driver via `hs.apply_fg_robustness_tag(staging_row, tag)` after Phase 3 web fallback completes. Phase 4's robustness counter aggregates over whichever tag is current when Gate 2 runs.
-9. **Hand off to Phase 1** — pass `staging_rows` list in memory. Phase 1 treats each entry as a candidate row; NEW rows get appended, REFRESH rows follow `fields_to_refresh`.
-10. **Cache cleanup** — on successful Phase 5 write, `cleanup_cache_dir(cache_dir, had_failures=False)`. On abort or mid-run failure, preserve cache and print path.
+6. **LLM relevance check** (NEW, 2026-05) — for each pre-filter-passing candidate, agent driver invokes `mcp__firecrawl__firecrawl_scrape` on `cand['multi_files_url']` with `jsonOptions={"schema": hs.LLM_RELEVANCE_SCHEMA, "prompt": hs.LLM_RELEVANCE_PROMPT}`, then calls `hs.apply_llm_relevance(cand, fc_data)`. Output: candidates flagged with `llm_downgrade_candidate` qc-flag + `llm_downgrade_reason` get filtered into the **LLM DOWNGRADED** bucket of the Gate 1 render. Cost: ~5 credits/candidate × ~12 candidates/month = ~60 credits/month (well within Firecrawl free tier). **Why this exists**: keyword pre-filter matches on legacy company names; e.g., `Fujian Wanchen FOOD GROUP (formerly known as Wanchen Biotechnology)` historically passed the filter despite the company having pivoted out of life sciences. The LLM check looks at the issuer's CURRENT business and downgrades these. Skip this step if Firecrawl is unavailable — the bucket stays empty, and the user surfaces rebrands manually at Gate 1.
+7. **GATE 1** — render the candidate list below and WAIT for user approval. No PDFs fetched until approval. Now includes LLM DOWNGRADED bucket from step 6 with default recommendation `drop`.
+8. **Create cache dir** — `create_cache_dir()` under `checkpoints/YYYY-MM-DD_a1_hkex_pdfs/` (with `_2`/`_3` suffix on collision from aborted prior run).
+9. **Per-approved-candidate extraction loop** — for each candidate, run the following sub-steps in order:
+   - **(9a)** `fetch_targeted_chapters(cand, cache_dir)` — parse Multi-Files TOC, match **5 chapter slots** (`summary`, `business`, `financial`, `parties`, `history`), download all available chapter PDFs (~6 MB total per candidate). The 2 new optional slots (added 2026-05): **PARTIES** (`DIRECTORS AND PARTIES INVOLVED` / variant `DIRECTORS, SUPERVISORS AND PARTIES INVOLVED` for A-share dual-listings) holds sponsor info — col I extraction now reads here. **HISTORY** (`HISTORY, DEVELOPMENT AND CORPORATE STRUCTURE`) for F-column structure verification (Cayman vs VIE detection). PARTIES + HISTORY missing does NOT fail the candidate (logged as `optional_chapters_missing`). Also populates `cand['chapter_urls']` per slot for Firecrawl in step 9c.
+   - **(9b)** `staging_row = extract_fields_from_chapters(cand, target_fy=target_fy)` — **3-tier financial extraction** on J/K/L:
+     - **Tier 1**: `pdfplumber.extract_tables()` on FINANCIAL chapter (clean rows)
+     - **Tier 2**: text-based sliding window on FINANCIAL (visual tables)
+     - **Tier 3** (NEW): `extract_financials_from_narrative()` on SUMMARY chapter — regex anchors on prose like `"we recorded total revenue of RMB X million"` / `"loss before tax of RMB X million"` / `"cash and cash equivalents at end of year RMB X million"`. Only fires when Tiers 1+2 return None or low-confidence; takes the LAST RMB-million token after each anchor (since TRP narratives list oldest-to-newest).
+     Sponsor (col I) regex now reads PARTIES chapter (was SUMMARY pre-2026-05); falls back to SUMMARY when PARTIES absent. F/G/H/M still left None for Firecrawl in step 9c.
+   - **(9c)** **Firecrawl narrative extraction for F/G/H/M** — invoke `mcp__firecrawl__scrape` on the candidate's SUMMARY chapter URL (from `cand['chapter_urls']['summary']`) with `formats=["json"]` and `jsonOptions={"schema": hs.FIRECRAWL_NARRATIVE_SCHEMA, "prompt": hs.FIRECRAWL_NARRATIVE_PROMPT}`. The MCP call returns a dict under `.json` with keys `shareholder_structure / business_model / sector / lead_asset`. Pass that dict to `hs.apply_firecrawl_narrative(staging_row, fc_data)` which maps it onto F/G/H/M, sets provenance to `firecrawl:SUMMARY`, sets confidence to `high`, and clears the pending QC flags for any field that came back non-null. Fields Firecrawl returned null for remain as `None` + pending flag — Phase 4 will surface them for manual fill. See [Firecrawl MCP Integration](#firecrawl-mcp-integration-cols-fghm) for schema/prompt details, cost, and fallback behavior.
+   - **(9d)** **Robustness tag classification** — after `apply_firecrawl_narrative()` returns, call `hs.auto_classify_fg_robustness(staging_row)` to assign a Phase-0-determinable F+G robustness tag (one of `verified_fg_prospectus` / `single_source_prospectus_fg` / `not_found_fg` — see [Robustness Tag Vocabulary](#robustness-tag-vocabulary) below). The function reads `_provenance` / `_confidence` / `row_draft` for cols F and G and mutates the staging row in place, appending the chosen tag to `_qc_flags` and the canonical suffix to `row_draft["N"]`. The web-fallback tags (`web_cross_checked_fg` / `single_source_family_fg` / `conflicting_fg`) cannot be auto-determined from Python state — they're set by the agent driver via `hs.apply_fg_robustness_tag(staging_row, tag)` after Phase 3 web fallback completes. Phase 4's robustness counter aggregates over whichever tag is current when Gate 2 runs.
+10. **Hand off to Phase 1** — pass `staging_rows` list in memory. Phase 1 treats each entry as a candidate row; NEW rows get appended, REFRESH rows follow `fields_to_refresh`.
+11. **Cache cleanup** — on successful Phase 5 write, `cleanup_cache_dir(cache_dir, had_failures=False)`. On abort or mid-run failure, preserve cache and print path.
 
 ### GATE 1 — Candidate list approval format
 
@@ -280,7 +285,34 @@ Key conventions:
 
 This is **Gate 2**. Gate 1 was the Phase 0 candidate approval (only when Phase 0 ran). Both gates must pass before any write. **Never skip Phase 4**, even when Phase 0 looked fine.
 
-When a staging row has `_confidence["X"] == "low"` OR `pdf_status != "ok"`, surface it in the diff with a QC flag line like `"PHASE0 LOW-CONF: col H confidence=low"` or `"PHASE0 pdf_status=partial (missing chapter: financial)"` so the user can decide whether to accept, correct, or drop.
+#### Phase 4 sections (in render order)
+
+1. **Extraction Health Dashboard** (NEW, 2026-05) — `hs.compute_extraction_health(staging_rows)` aggregates per-column extraction success and `hs.render_extraction_health(...)` formats it. Shown at the TOP of Gate 2. Each col gets `success / low_conf / blank` counts and a percentage. **If any col < 50% success, `abort_recommended=True`** — Gate 2 prompt should default-suggest `abort` and ask user to investigate root cause before proceeding. Example output:
+   ```
+   === Extraction Health (NEW + REFRESH being written) ===
+     OK     11/11  100%  F (structure)
+     OK     11/11  100%  G (business)
+     OK     11/11  100%  H (sector)
+     FAIL    0/11    0%  I (sponsor)         ← chapter routing bug, BLOCKS Phase 5
+     WARN    7/11   64%  J (revenue)         (4 low-conf -- pdfplumber dotted-leader)
+     ...
+     >> ABORT RECOMMENDED: cols I below 50% success.
+   ```
+   This catches systematic bugs (e.g., a regression in `_extract_col_I_sponsor`) before they corrupt the master tracker. Don't suppress this section even when nothing is broken.
+
+2. **Master vs Extraction Diff** (NEW, 2026-05; REFRESH rows only) — for each REFRESH row, agent driver calls `hs.diff_against_master(staging_row, master_row, cols=("F","G","H","I","M"))` and surfaces deltas as a `=== POTENTIAL STALE MASTER ===` block. Each delta is one of:
+   - `divergent`: master and extracted disagree (e.g., master M="TMX-049: TRPC5 inhibitor" but prospectus says "AP301: phosphate binder" — likely stale master)
+   - `extracted_more_detailed`: extracted is a strict superset of master (e.g., master I="Jefferies, BAML" but prospectus has "Jefferies, BAML, Huatai")
+
+   Per-row decisions: `keep master <row> <col>` / `take extracted <row> <col>` / `skip review <row> <col>`. The "only fill blanks" rule is preserved by default — diff is purely informational unless user opts in via `take extracted`.
+
+3. **Per-row diff** (existing) — column-by-column `old → new` summary for each NEW + REFRESH row.
+
+4. **Robustness summary** (existing) — F+G robustness tag counts.
+
+5. **QC flags** (existing) — Firecrawl-pending, off-enum, pdf_status, etc.
+
+When a staging row has `_confidence["X"] == "low"` OR `pdf_status != "ok"`, surface it in section 5 with a QC flag line like `"PHASE0 LOW-CONF: col H confidence=low"` or `"PHASE0 pdf_status=partial (missing chapter: financial)"` so the user can decide whether to accept, correct, or drop.
 
 **Firecrawl-specific flags to surface in Phase 4**:
 - Any `firecrawl_pending_col_X` in `_qc_flags` → Firecrawl did not fill that column. Either Firecrawl was skipped, returned null, or was unavailable. Display as `"FIRECRAWL PENDING: col X blank — fill manually or retry firecrawl"`. Block Phase 5 save until the user either fills the cell or explicitly accepts a blank.
@@ -375,6 +407,20 @@ Confirm to write? (yes / fix <row X> / accept blank <row X> / keep prospectus <r
    - Rows with unparseable / None dates sort to the bottom.
    - Move each row's values + per-cell styles + row height together — never split a row's content from its formatting during the sort.
 3. **Force dd/mm/yyyy format on col C** — apply `number_format = 'dd/mm/yyyy'` to every populated col C cell in the data region. The HKEX website displays filing dates as `dd/mm/yyyy` and the tracker must match. Do not preserve the original per-row format for col C; uniformize.
+
+**3b. Recompute col B status (NEW, 2026-05) — REQUIRED every save**:
+   For every data row with a parseable col C filing date, set col B = `hs.compute_status(filing_date, today)`. The function returns:
+   - `None` (cleared) when the filing is 0–3 months old (fresh)
+   - `"Expiring in 2 month"` / `"Expiring in 1 month"` when 4–5 months old
+   - `"Expired"` when ≥6 months old (HKEX A1 6-month validity window)
+   On REFRESH, the new filing_date resets the row to fresh (B=None). On periodic monthly runs, all rows get re-stamped. Do NOT preserve master col B values; they're stale by definition once filing_date or today changes.
+
+**3c. Validate col F enum (NEW, 2026-05) — REQUIRED before save**:
+   For every data row with a non-empty col F, run `valid, replacement = hs.validate_col_f_value(value)`. Behavior:
+   - `valid=True` → pass through, no change
+   - `valid=False, replacement="Red Chip"` → legacy `Cayman holdco` / `BVI holdco` / `Bermuda holdco` value present; either auto-migrate (rewrite F=`Red Chip` + append `[Cayman-incorporated]` to col N) OR pause and prompt user
+   - `valid=False, replacement=None` → unknown value; HARD STOP, refuse to save until user resolves
+   For batch migration of an entire tracker (e.g., after the May 2026 enum collapse), use `python3 scripts/migrate_col_f_v2.py [--apply]` which dry-runs by default and writes back with `--apply`. The migration script auto-creates a `*_pre_col_f_v2_migration_backup.xlsx` snapshot before mutating.
 
 **3a. Force Arial size 8 BLACK font on the ENTIRE region — not just col N, not just populated cells** — apply `Font(name='Arial', size=8, color='FF000000', ...)` to **every cell** in rows 1 through last_data_row, cols A through (at least) N. Include BLANK cells too: if you only touch populated cells, then later editing a previously-blank cell will reveal Excel's default Calibri 11 (the exact bug this rule prevents). Preserve bold/italic/underline/strike but force name + size + color:
 
