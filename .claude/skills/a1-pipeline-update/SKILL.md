@@ -91,6 +91,7 @@ Phase 0 produces an in-memory list of `staging_row` dicts that Phase 1 consumes 
    - **(8a)** `fetch_targeted_chapters(cand, cache_dir)` — parse Multi-Files TOC, match SUMMARY/BUSINESS/FINANCIAL, download the three chapter PDFs (~5 MB total per candidate). Also populates `cand['chapter_urls']` with the remote URLs for each slot — Firecrawl needs these in step 8c.
    - **(8b)** `staging_row = extract_fields_from_chapters(cand, target_fy=target_fy)` — pdfplumber table parser on FINANCIAL for J/K/L, regex on pdfplumber SUMMARY text for I (sponsor), assembled col N with FY marker. **Leaves F/G/H/M as `None`** and tags the row with `firecrawl_pending_col_F/G/H/M` QC flags. This step is deterministic, offline, and cheap — if Firecrawl is unavailable for any reason, the skill can still proceed to Phase 4 and let the user fill F/G/H/M manually.
    - **(8c)** **Firecrawl narrative extraction for F/G/H/M** — invoke `mcp__firecrawl__scrape` on the candidate's SUMMARY chapter URL (from `cand['chapter_urls']['summary']`) with `formats=["json"]` and `jsonOptions={"schema": hs.FIRECRAWL_NARRATIVE_SCHEMA, "prompt": hs.FIRECRAWL_NARRATIVE_PROMPT}`. The MCP call returns a dict under `.json` with keys `shareholder_structure / business_model / sector / lead_asset`. Pass that dict to `hs.apply_firecrawl_narrative(staging_row, fc_data)` which maps it onto F/G/H/M, sets provenance to `firecrawl:SUMMARY`, sets confidence to `high`, and clears the pending QC flags for any field that came back non-null. Fields Firecrawl returned null for remain as `None` + pending flag — Phase 4 will surface them for manual fill. See [Firecrawl MCP Integration](#firecrawl-mcp-integration-cols-fghm) for schema/prompt details, cost, and fallback behavior.
+   - **(8d)** **Robustness tag classification** — after `apply_firecrawl_narrative()` returns, call `hs.auto_classify_fg_robustness(staging_row)` to assign a Phase-0-determinable F+G robustness tag (one of `verified_fg_prospectus` / `single_source_prospectus_fg` / `not_found_fg` — see [Robustness Tag Vocabulary](#robustness-tag-vocabulary) below). The function reads `_provenance` / `_confidence` / `row_draft` for cols F and G and mutates the staging row in place, appending the chosen tag to `_qc_flags` and the canonical suffix to `row_draft["N"]`. The web-fallback tags (`web_cross_checked_fg` / `single_source_family_fg` / `conflicting_fg`) cannot be auto-determined from Python state — they're set by the agent driver via `hs.apply_fg_robustness_tag(staging_row, tag)` after Phase 3 web fallback completes. Phase 4's robustness counter aggregates over whichever tag is current when Gate 2 runs.
 9. **Hand off to Phase 1** — pass `staging_rows` list in memory. Phase 1 treats each entry as a candidate row; NEW rows get appended, REFRESH rows follow `fields_to_refresh`.
 10. **Cache cleanup** — on successful Phase 5 write, `cleanup_cache_dir(cache_dir, had_failures=False)`. On abort or mid-run failure, preserve cache and print path.
 
@@ -250,6 +251,10 @@ Process each bucket:
 
 Sources in priority order: `hkexnews.hk` (prospectus PDFs — via Firecrawl scrape on the chapter URL with `FIRECRAWL_NARRATIVE_SCHEMA`) → company website → Chinese financial news → PitchBook / BioCentury. For the prospectus itself, you can skip the Phase 0 pdfplumber path entirely and call Firecrawl directly on the chapter URL; for TRULY NEW rows that arrive from the new Excel without Phase 0 having run, this is the fastest path to a filled F/G/H/M.
 
+**Robustness tag classification (after extraction completes for each TRULY NEW row)**: same hook as Phase 0 step 8d — once F/G/H/M are filled (via prospectus, web fallback, or both), classify the row's F+G robustness per the [Robustness Tag Vocabulary](#robustness-tag-vocabulary) (§ Phase 4 below) and append the tag to `_qc_flags` + col N suffix. The tag drives Phase 4's robustness counter and may block Phase 5 (e.g., `not_found_fg` blocks until user `accept blank <row>`; `conflicting_fg` blocks until `keep prospectus <row>` / `keep <secondary> <row>`).
+
+**Bounded-effort discipline** (`/web-research` Rule 10 borrowing): for any TRULY NEW row where the prospectus path fails, cap web-fallback at **3 distinct Tier-1 attempts** (e.g., firecrawl_search top-3 hits + IR page; OR HKEX archive index + cls.cn + Caixin). After 3 failures, stop, tag `not_found_fg`, and surface in Gate 2. Do not silently downgrade to lower-tier sources without the tag, and do not recurse into PitchBook / BioCentury / proprietary databases without explicit user authorization.
+
 Key conventions:
 - **Col F decision rule**: "股份有限公司" (domestic joint stock) → H-share; offshore Cayman/BVI holdco → Red Chip; VIE structure → VIE.
 - **Col D suffix**: `-B` = Ch.18A biotech; `-P` = Ch.18C specialist tech; none = Main Board / commercial.
@@ -257,10 +262,16 @@ Key conventions:
 
 **Cols F and G — mandatory verification (no blanks allowed)**:
 - **Every row in every save** must have cols F (Shareholder Structure) AND G (Business Model / Clinical Stage of Core Asset) populated — this applies to NEW rows, REFRESH rows, AND any pre-existing row that happens to be blank when the skill runs.
-- **Verification rule**: Col F and G values must be sourced from the prospectus (first choice) or two independent public sources (second choice, typically company website + Chinese financial news). Never infer col F from the company name alone; always check the corporate structure section of the prospectus.
+- **Verification rule**: Col F and G values must be sourced from the prospectus (first choice — Tier 1) or two independent public sources (second choice, only when prospectus is unavailable). Never infer col F from the company name alone; always check the corporate structure section of the prospectus.
+- **Independence definition** (only relevant when falling back to web sources because prospectus is paywalled / 404 / Firecrawl returned null on F or G): "two independent public sources" means **different issuer entity AND different document class**. The following all count as ONE source family and do **NOT** satisfy the rule on their own:
+  - Same issuer, different docs — company website + same-issuer press release; HKEXnews announcement + same-issuer cited in news
+  - **Parent + majority-owned subsidiary** — 集团公告 + 子公司公告; Cayman holdco filing + onshore PRC subsidiary filing; A-share parent + H-share child of the same group
+  - Same trade-media family — different sections of the same outlet (e.g., 财联社 主页 + 财联社 IPO 板块; sina finance + sina news re-cite)
+
+  To satisfy ≥2 independent sources, pair the issuer family with at least one of: **regulator filing** (HKEXnews / SAMR / NMPA / 巨潮资讯网 / 港交所披露易), **independent trade-media** (Caixin 财新 / 21财经 / Endpoints / FierceBiotech / BioCentury), or **PitchBook / S&P Capital IQ**. Single-family-only sources → tag `[Single source family — verify]` per the Robustness Tag Vocabulary (§ Phase 4 below) — do NOT silently treat as verified.
 - **Col F taxonomy** (use exactly one of): `H-share` | `Red Chip` | `VIE` | `Cayman holdco` | `BVI holdco` — `H-share` for PRC-domiciled joint stock companies (股份有限公司 incorporated in PRC), `Red Chip` for offshore-holdco structures without VIE, `VIE` when a variable interest entity is in the chain, `Cayman holdco` / `BVI holdco` when offshore but not using VIE.
 - **Col G format**: `<stage>; <one-line description of business model or core asset status>`. Stage = one of `Commercial-stage` | `Clinical-stage` | `Pre-clinical` | `Commercialized` (for commercial-stage non-biotech). Example: "Clinical-stage; 5 assets in Phase II/III oncology pipeline, pre-revenue" or "Commercialized; #2 goat milk formula brand in China (14% share)".
-- **If both prospectus and web search fail to yield F or G**, pause and ask the user before writing; do NOT guess or leave blank.
+- **If both prospectus and web search (≥3 distinct Tier-1 attempts) fail to yield F or G**, do not guess — apply the `[NOT FOUND — searched: <list>]` robustness tag, leave the cell blank, and surface in Gate 2 for user override. (Bounded-effort discipline borrowed from `/web-research` Rule 10.)
 - **When refreshing a row**, re-verify F and G against the latest prospectus even if they already have values — business models and structures do change (e.g., Sirius Therapeutics went from Cayman holdco to Red Chip in its re-filing).
 
 **Pause and ask the user when**: prospectus contradicts web search; FY financials disclosed in multiple currencies with no clear RMB figure; sector is genuinely ambiguous (e.g., dx company with therapeutic pipeline); col F or G cannot be determined from prospectus + web.
@@ -276,6 +287,30 @@ When a staging row has `_confidence["X"] == "low"` OR `pdf_status != "ok"`, surf
 - Any `firecrawl_off_enum_H: <value>` in `_qc_flags` → Firecrawl returned a sector string not in `CANONICAL_SECTORS`. Surface the raw value, ask the user to map it or override. The row_draft["H"] remains `None` until resolved.
 - Per-field provenance now includes `firecrawl:SUMMARY` for rescued cols — include the provenance tag in the diff so the reviewer knows which cells came from the LLM vs. the HKEX feed vs. pdfplumber.
 
+#### Robustness Tag Vocabulary
+
+> Borrowed from `/web-research` Tag Vocabulary + Rule 4 (independent sources) + Rule 10 (bounded effort). Applies to **F + G robustness only** — these are the two narrative fields where source robustness varies row-by-row. (H sector is enum-validated; M lead asset is informational; J/K/L are pdfplumber-deterministic; I is regex-templated; C/D/E come from the authoritative HKEX feed.)
+
+Every NEW or REFRESH row gets exactly **one** F+G robustness tag, assigned at Phase 0 step 8d (or at Phase 3 web-fallback step for non-Phase-0 rows). The tag drives Phase 4's robustness counter aggregation and the col N suffix.
+
+| Trigger condition | `_qc_flags` entry | Col N suffix |
+|---|---|---|
+| Phase 0 path: prospectus extraction succeeded; F+G+H+M all non-null + in-enum + `_confidence == "high"` | `verified_fg_prospectus` | `[VERIFIED F+G — prospectus]` |
+| Phase 0 path: F or G non-null but `_confidence` includes `"low"` or `"medium"` (e.g., Firecrawl extracted but the prospectus section was ambiguous) | `single_source_prospectus_fg` | `[Single source — prospectus only]` |
+| Phase 3 fallback: prospectus 404 / Firecrawl null → ≥2 **independent** web sources (per the Independence definition in Phase 3) agreed on F and G | `web_cross_checked_fg` | `[Web cross-checked F+G]` |
+| Phase 3 fallback: prospectus 404 / Firecrawl null → only one source family found, no independent confirmation | `single_source_family_fg` | `[Single source family — verify]` |
+| **All Tier-1 attempts failed** (prospectus + 3 distinct firecrawl_search top hits + IR page) — bounded-effort discipline | `not_found_fg` | `[NOT FOUND — searched: prospectus, firecrawl_search top-3, IR]` |
+| Prospectus extraction conflicts with a secondary source (e.g., prospectus says "Cayman holdco", IR page says "VIE in chain") | `conflicting_fg` | `[Conflicting — used prospectus]` (footnote which source was discarded in col N) |
+
+**Mutual exclusion**: pick the dominant tag per row. A row that's prospectus-anchored AND web cross-checked still tags as `verified_fg_prospectus` (the prospectus is Tier 1 — additional cross-check is bonus, not separate state). A row tagged `not_found_fg` cannot also be `conflicting_fg`.
+
+**Phase 5 write blocking**:
+- `not_found_fg` → block Phase 5 unless user fills cells in Gate 2 OR explicitly accepts blank with `accept blank <row>`
+- `conflicting_fg` → block Phase 5 unless user confirms which source to use with `keep prospectus <row>` / `keep <secondary> <row>`
+- All other tags pass through
+
+**Implementation note**: tag classification logic lives in the skill driver (not in `hkex_scraper.py`), invoked after `apply_firecrawl_narrative()` returns or after web-fallback completes. The Python module exposes the building blocks (`_provenance` / `_confidence` / off-enum detection); the driver synthesizes the appropriate tag per row.
+
 **Before writing anything**, present to the user:
 
 ```
@@ -283,28 +318,49 @@ Projected tracker state:
   Existing rows:     M → M' (+n new, -d duplicate-deletes)
   Candidate rows:    N → 0 (all filled)
 
+--- F+G robustness summary (NEW + REFRESH rows being written) ---
+  [VERIFIED F+G — prospectus]:        X / Y rows  (Tier-1 prospectus, high-confidence)
+  [Single source — prospectus only]:  S rows      (prospectus extracted but low/medium confidence)
+  [Web cross-checked F+G]:            W rows      (prospectus failed → ≥2 independent web sources)
+  [Single source family — verify]:    K rows      (prospectus failed → only one source family — analyst review needed)
+  [Conflicting — used prospectus]:    P rows      (prospectus vs secondary disagreement — discarded source footnoted)
+  [NOT FOUND — searched: ...]:        L rows      (bounded-effort fail — manual fill or accept blank required)
+  Stale FY data (older than target):  T rows      (col N flagged with FY note)
+
+  → IC-grade target:  [VERIFIED] + [Web cross-checked] ≥ 80% of (Y-S-K-L) row pool
+  → Block-Phase-5 row count (not_found_fg + conflicting_fg unresolved): <count>
+
 --- TRULY NEW (n rows) ---
-  1. <CompanyName-B> (<Chinese>) | <structure> | <sector> | <sponsor>
+  1. <CompanyName-B> (<Chinese>) | <structure> | <sector> | <sponsor>  [<F+G tag>]
      FY25 rev <X>m / NI <-Y>m / cash <Z>m
      Lead: <one-liner>
      Highlights: <first-sentence>
+     Provenance: F=<src> G=<src> H=<src> M=<src>     (e.g., F=firecrawl:SUMMARY, G=firecrawl:SUMMARY, H=firecrawl:SUMMARY, M=firecrawl:SUMMARY)
 
 --- DATA RECOVERY (r rows) ---
-  1. <Company> — recovered from old file row <N>
+  1. <Company> — recovered from old file row <N>  [<F+G tag carried over OR re-verified>]
      FY refresh: FY24 → FY25 (needed / not needed)
 
 --- DUPLICATE → DELETE (d rows) ---
   1. <Company> | old row <N> deleted, new row keeps latest filing date
 
 --- QC FLAGS (c rows) ---
-  1. <Company> — <reason>
+  1. <Company> — <reason>      (Firecrawl pending / off-enum / pdf_status partial / etc.)
 
 Output path: <new_file with version suffix v+1>
 
-Confirm to write? (yes / fix <row X> / dry run / stop)
+Confirm to write? (yes / fix <row X> / accept blank <row X> / keep prospectus <row X> / dry run / stop)
 ```
 
-**Wait for explicit user confirmation** (`yes` / `go` / `OK`) before Phase 5. If user says `dry run`, exit cleanly without any file changes.
+**Reading the robustness summary**:
+- High `[VERIFIED F+G — prospectus]` percentage = clean Phase 0 run; little manual review needed.
+- Non-zero `[Single source family — verify]` or `[NOT FOUND]` = analyst attention required before Phase 5.
+- Any `[Conflicting]` row blocks Phase 5 until you pick `keep prospectus <row>` or `keep <secondary> <row>` (Independence definition in Phase 3 — discarded source goes in col N as footnote).
+
+**Wait for explicit user confirmation** (`yes` / `go` / `OK`) before Phase 5. If user says `dry run`, exit cleanly without any file changes. New per-row overrides accepted in Gate 2:
+- `accept blank <row>` — accept a `not_found_fg` row with F or G blank (overrides Phase 5 block)
+- `keep prospectus <row>` / `keep <secondary> <row>` — resolve a `conflicting_fg` row by picking the winning source
+- `fix <row>` — pause for manual cell fill before re-presenting Gate 2
 
 ### Phase 5 — Write + QC (only after confirmation)
 
@@ -409,6 +465,18 @@ assert set(fonts.keys()) == {('Arial', 8.0)}, f"Non-uniform fonts: {fonts}"
 - [ ] **No unresolved `firecrawl_pending_col_X` flags on rows being written**: every staging row that survived Phase 4 either has F/G/H/M populated (via Firecrawl or manual fill) or has been explicitly accepted as blank by the user during Gate 2. Run `all("firecrawl_pending" not in f for row in staging_to_write for f in row.get("_qc_flags", []))` before save.
 - [ ] **No `firecrawl_off_enum_H` flags**: any off-enum sector returns from Firecrawl have been mapped into `CANONICAL_SECTORS` and the flag cleared.
 - [ ] **Firecrawl provenance is recorded**: for rows where F/G/H/M came from Firecrawl, `_provenance["F"/"G"/"H"/"M"]` starts with `firecrawl:` — useful for later audit.
+- [ ] **Every NEW + REFRESH row has exactly ONE F+G robustness tag** in `_qc_flags`: from `{verified_fg_prospectus, single_source_prospectus_fg, web_cross_checked_fg, single_source_family_fg, conflicting_fg, not_found_fg}`. Run:
+  ```python
+  ROBUSTNESS_TAGS = {"verified_fg_prospectus", "single_source_prospectus_fg",
+                     "web_cross_checked_fg", "single_source_family_fg",
+                     "conflicting_fg", "not_found_fg"}
+  for row in new_or_refresh_rows:
+      tags = [f for f in row.get("_qc_flags", []) if f in ROBUSTNESS_TAGS]
+      assert len(tags) == 1, f"Row {row} has {len(tags)} robustness tags (expected 1): {tags}"
+  ```
+- [ ] **No unresolved `not_found_fg` rows**: every `not_found_fg` row has either had F/G manually filled in Gate 2 (clears the tag) OR has been explicitly `accept blank <row>` by user. Run `all("not_found_fg" not in row.get("_qc_flags", []) or row.get("_user_accept_blank") for row in staging_to_write)` before save.
+- [ ] **No unresolved `conflicting_fg` rows**: every `conflicting_fg` row has been resolved via `keep prospectus <row>` / `keep <secondary> <row>` (which sets `_user_resolved_conflict` and rewrites col N footnote with the discarded source).
+- [ ] **Col N suffix matches `_qc_flags` robustness tag** for every NEW + REFRESH row. Sanity check: if `_qc_flags` contains `verified_fg_prospectus`, col N must end with `[VERIFIED F+G — prospectus]` (or analogous for other tags).
 
 ## Edge Cases — When Auto-Discovery or the Pipeline Breaks
 
@@ -424,10 +492,11 @@ assert set(fonts.keys()) == {('Arial', 8.0)}, f"Non-uniform fonts: {fonts}"
 | **openpyxl `read_only=True` strips formatting on save** | Never use `read_only=True` for the NEW file. Read-only is fine for the OLD file (lookup only, never written back). |
 | **Chinese characters render as `_x0000_` placeholders** | This is an openpyxl encoding issue with rich-text or shared-string artifacts. Re-open with `keep_vba=False, data_only=False`. If still broken, fall back to copying the cell value via `cell.value = str(val).strip()` and let the user re-verify. |
 | **Date col C has mixed types** (some `datetime`, some `str`, some `int` Excel serials) | Coerce all to `datetime.datetime` in Phase 5 before write. For string dates, use `dateutil.parser.parse(s, dayfirst=True)`. For Excel serials, use `openpyxl.utils.datetime.from_excel(s)`. Surface all coercions in the Phase 4 diff. |
-| **Prospectus PDF is paywalled or 404** (HKEX archives) | Fall back to `mcp__firecrawl__search` with query "`<company> HKEX A1 prospectus`" → if a hit is found, pipe the URL to `mcp__firecrawl__scrape`. If still no source, mark the row with `[NEEDS REVIEW]` in col N and let user resolve in next iteration. Do not fabricate financials. |
-| **Firecrawl API unavailable or credits exhausted** | `extract_fields_from_chapters` has already returned a staging row with F/G/H/M as `None` and `firecrawl_pending_col_X` QC flags attached. Skip the `mcp__firecrawl__scrape` call, proceed to Phase 4, and let the user fill F/G/H/M manually during the Gate 2 review. **Do NOT fabricate values or fall back to the deleted regex extractors.** I (sponsor) and J/K/L (financials) are unaffected because they never depended on Firecrawl. |
-| **Firecrawl returns null for F/G/H/M** (schema satisfied but LLM couldn't find the field) | `apply_firecrawl_narrative` keeps the cell as `None` and the `firecrawl_pending_col_X` flag stays. Surface in Phase 4 diff; user chooses: fill manually, retry Firecrawl with a wider page range, or accept blank. |
-| **Firecrawl returns an off-enum sector for col H** | `apply_firecrawl_narrative` adds `firecrawl_off_enum_H: <raw>` to `_qc_flags` and leaves col H as `None`. Surface in Phase 4 diff with the raw value so the user can map it into `CANONICAL_SECTORS`. |
+| **Prospectus PDF is paywalled or 404** (HKEX archives) | Apply bounded-effort discipline (Phase 3 web-fallback): try **3 distinct Tier-1 attempts** — `mcp__firecrawl__search` with `<company> HKEX A1 prospectus` (top-3 hits) + company IR page. Each hit found → pipe URL through `mcp__firecrawl__scrape` with `FIRECRAWL_NARRATIVE_SCHEMA`. If ≥2 independent web sources agree per the Independence definition (Phase 3) → tag `web_cross_checked_fg`. If only one source family found → tag `single_source_family_fg`. After 3 failures → tag `not_found_fg` + col N = `[NOT FOUND — searched: prospectus, firecrawl_search top-3, IR]`. Block Phase 5 until user `accept blank <row>` in Gate 2. Do not fabricate financials. |
+| **Firecrawl API unavailable or credits exhausted** | `extract_fields_from_chapters` has already returned a staging row with F/G/H/M as `None` and `firecrawl_pending_col_X` QC flags attached. Skip the `mcp__firecrawl__scrape` call, proceed to Phase 4, and let the user fill F/G/H/M manually during the Gate 2 review. Tag the row `single_source_family_fg` if the user fills from a single web source, or `not_found_fg` if they `accept blank`. **Do NOT fabricate values or fall back to the deleted regex extractors.** I (sponsor) and J/K/L (financials) are unaffected because they never depended on Firecrawl. |
+| **Firecrawl returns null for F/G/H/M** (schema satisfied but LLM couldn't find the field) | `apply_firecrawl_narrative` keeps the cell as `None` and the `firecrawl_pending_col_X` flag stays. Trigger Phase 3 web-fallback for that row (bounded-effort 3 Tier-1 attempts), then re-classify the F+G robustness tag accordingly. Surface in Phase 4 diff with the resulting tag (`web_cross_checked_fg` / `single_source_family_fg` / `not_found_fg`); user chooses: fill manually, retry Firecrawl with a wider page range, or accept blank. |
+| **Firecrawl returns an off-enum sector for col H** | `apply_firecrawl_narrative` adds `firecrawl_off_enum_H: <raw>` to `_qc_flags` and leaves col H as `None`. Surface in Phase 4 diff with the raw value so the user can map it into `CANONICAL_SECTORS`. (This is a col H issue, not an F+G robustness issue — the row's F+G tag is independent.) |
+| **Prospectus and secondary source disagree on F or G** (e.g., prospectus says "Cayman holdco", IR page says "VIE in chain") | Tag the row `conflicting_fg`, set col N suffix to `[Conflicting — used prospectus]` with footnote naming the discarded source, and **block Phase 5** until user resolves with `keep prospectus <row>` (default — Tier 1 wins per source hierarchy) OR `keep <secondary> <row>` + brief justification (e.g., "prospectus is stale, IR page is post-restructuring"). Update col N footnote to reflect the resolution. |
 | **Sponsor list contains 4+ banks** (rare jumbo deals) | Truncate to first 3 in col I + append "et al." Full list goes in col N. |
 | **Same company appears under both English and Chinese name in different rows** | Phase 2 normalize step handles English `-B`/`-P` suffix, but if the new file has one row with English name and another with Chinese name, treat as DUPLICATE and merge — keeping the row with the more recent filing date. Surface in Phase 4 diff. |
 
@@ -445,7 +514,10 @@ All Phase 0 logic lives in `hkex_scraper.py` — **canonical location**: [`hkex-
 | `fetch_targeted_chapters(candidate, cache_dir)` | Parses Multi-Files TOC, picks SUMMARY/BUSINESS/FINANCIAL via `CHAPTER_VARIANTS`, downloads each chapter PDF. Also populates `candidate['chapter_urls']` with the remote URLs per slot (used by Firecrawl in step 8c). Sets `pdf_status` to ok/partial/no_toc/failed. |
 | `extract_fields_from_chapters(candidate, target_fy="FY25")` | Builds a `row_draft` dict keyed by col letter C..N + `_provenance` + `_confidence`. Deterministic: C/D/E from HKEX feed, J/K/L from pdfplumber FINANCIAL table, I from regex on pdfplumber SUMMARY text, N assembled from FY label + pdf_status. **F/G/H/M are left as None** with `firecrawl_pending_col_X` QC flags — these are expected to be filled by a downstream `apply_firecrawl_narrative` call from the skill driver. |
 | `apply_firecrawl_narrative(staging_row, fc_data, source_label="firecrawl:SUMMARY")` | Merges a Firecrawl `/scrape` JSON-format result into a staging row. Maps `shareholder_structure`/`business_model`/`sector`/`lead_asset` onto `row_draft["F"/"G"/"H"/"M"]`, updates provenance + confidence, and clears pending QC flags. Guards col H against off-enum sector values. |
+| `auto_classify_fg_robustness(staging_row)` | Phase 0 step 8d helper. Reads `_provenance` + `_confidence` + `row_draft` for cols F+G and assigns a Phase-0-determinable F+G robustness tag (`verified_fg_prospectus` / `single_source_prospectus_fg` / `not_found_fg`). Mutates row's `_qc_flags` + col N suffix in place. Returns the applied tag string. |
+| `apply_fg_robustness_tag(staging_row, tag, suffix_override=None)` | Manually apply / override a F+G robustness tag (used by the agent driver after Phase 3 web fallback for `web_cross_checked_fg` / `single_source_family_fg` / `conflicting_fg` / overrides of an auto-classified tag). Strips any pre-existing robustness tag from `_qc_flags` and any robustness suffix from col N before applying the new one. `suffix_override` lets the caller customize the col N suffix (e.g., for `not_found_fg` with a custom searched-attempts list, or `conflicting_fg` with a discarded-source footnote). Raises `ValueError` if `tag` is not in `FG_ROBUSTNESS_TAGS`. |
 | `FIRECRAWL_NARRATIVE_SCHEMA` / `FIRECRAWL_NARRATIVE_PROMPT` | Module-level constants the skill driver passes verbatim to `mcp__firecrawl__scrape` under `jsonOptions`. Defines the four narrative fields + their enum constraints + extraction instructions. |
+| `FG_ROBUSTNESS_TAGS` / `FG_ROBUSTNESS_COL_N_SUFFIX` | Module-level constants. The 6-tuple of allowed robustness tag strings + dict mapping each to its canonical col N suffix. Phase 4's robustness counter iterates over `FG_ROBUSTNESS_TAGS` to aggregate counts per tag. |
 | `cleanup_cache_dir(cache_dir, had_failures)` | `rmtree` cache on success; preserve on failure. Refuses to touch paths outside the `checkpoints/` root. |
 
 ### Skill-driver run pattern (REPL + agent)
@@ -492,6 +564,8 @@ For each row in staging where row["candidate"]["chapter_urls"]["summary"] is tru
     fc_data = (fc.get("data") or {}).get("json") or fc.get("json") or {}
     # Back to Python REPL:
     hs.apply_firecrawl_narrative(row, fc_data, source_label="firecrawl:SUMMARY")
+    # Phase 0 step 8d -- assign initial F+G robustness tag based on extraction state:
+    hs.auto_classify_fg_robustness(row)
 ```
 
 ```python
@@ -499,7 +573,9 @@ For each row in staging where row["candidate"]["chapter_urls"]["summary"] is tru
 hs.cleanup_cache_dir(cache_dir, had_failures=False)
 ```
 
-**Degraded path — Firecrawl unavailable**: skip the agent-side loop entirely. `staging` rows still have F/G/H/M as None with `firecrawl_pending_col_X` QC flags. Phase 4 surfaces them, user fills manually during Gate 2 review. The skill never crashes on Firecrawl failure.
+**Degraded path — Firecrawl unavailable**: skip the agent-side Firecrawl loop entirely (no `apply_firecrawl_narrative` call). `staging` rows still have F/G/H/M as None with `firecrawl_pending_col_X` QC flags. **Still call `hs.auto_classify_fg_robustness(row)` on each row** — it will tag them as `not_found_fg` (F or G is None), so Phase 4 surfaces the gap correctly. The user fills manually during Gate 2 review (which clears the tag — agent then calls `hs.apply_fg_robustness_tag(row, "single_source_family_fg")` or whichever tag matches the manual-fill source). The skill never crashes on Firecrawl failure.
+
+**Phase 3 web fallback (TRULY NEW path or any post-Phase-0 row that needs F/G)**: after the agent driver completes web fallback (≥3 Tier-1 attempts per `/web-research` Rule 10), it calls `hs.apply_fg_robustness_tag(row, tag)` directly with one of `web_cross_checked_fg` / `single_source_family_fg` / `conflicting_fg` / `not_found_fg` based on the fallback outcome — overriding whatever auto-classification set in step 8d.
 
 ### Python 3.9 compatibility
 

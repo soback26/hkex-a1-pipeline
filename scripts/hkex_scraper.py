@@ -120,6 +120,39 @@ FIRECRAWL_NARRATIVE_PROMPT = (
     "not 'CDMO')."
 )
 
+# F+G robustness tags. One tag per NEW/REFRESH row, surfaced in Phase 4
+# (Gate 2) and aggregated by the Phase 4 robustness counter. Borrowed from
+# /web-research Tag Vocabulary (Rule 4 + Rule 10) -- see
+# `.claude/skills/a1-pipeline-update/SKILL.md` Phase 4 Robustness Tag
+# Vocabulary section for the full decision table.
+FG_ROBUSTNESS_TAGS = (
+    "verified_fg_prospectus",        # Phase 0: prospectus + high confidence
+    "single_source_prospectus_fg",   # Phase 0: prospectus extracted but conf != "high"
+    "web_cross_checked_fg",          # Phase 3: prospectus failed -> >=2 independent web sources
+    "single_source_family_fg",       # Phase 3: prospectus failed -> only one source family
+    "conflicting_fg",                # Prospectus disagrees with secondary; needs user resolve
+    "not_found_fg",                  # All Tier-1 attempts failed; needs user accept_blank
+)
+
+FG_ROBUSTNESS_COL_N_SUFFIX = {
+    "verified_fg_prospectus":      "[VERIFIED F+G — prospectus]",
+    "single_source_prospectus_fg": "[Single source — prospectus only]",
+    "web_cross_checked_fg":        "[Web cross-checked F+G]",
+    "single_source_family_fg":     "[Single source family — verify]",
+    "conflicting_fg":               "[Conflicting — used prospectus]",
+    "not_found_fg":                 "[NOT FOUND — searched: prospectus, firecrawl_search top-3, IR]",
+}
+
+# Regex matching ANY robustness suffix at the end of col N (covers customized
+# suffixes too -- e.g., a not_found_fg row whose searched-list got tweaked,
+# or a conflicting_fg row whose discarded-source footnote was appended).
+# Used by apply_fg_robustness_tag to strip the existing suffix before adding
+# a new one (so re-classification doesn't double-stamp).
+_FG_ROBUSTNESS_SUFFIX_RE = re.compile(
+    r"\s*\[(?:VERIFIED F\+G|Single source|Web cross-checked|Conflicting|NOT FOUND)"
+    r"[^\]]*\]\s*$"
+)
+
 LEGAL_SUFFIX_STRIP = (
     "co., ltd.", "co.,ltd.", "co. ltd.",
     "company limited", "limited", "ltd.", "ltd",
@@ -1374,6 +1407,123 @@ def apply_firecrawl_narrative(
             )
         ]
     return staging_row
+
+
+def apply_fg_robustness_tag(
+    staging_row: Dict[str, Any],
+    tag: str,
+    suffix_override: Optional[str] = None,
+) -> str:
+    """Apply (or replace) the F+G robustness tag on a staging row.
+
+    Mutates `staging_row`:
+    1. Removes any pre-existing robustness tag from `_qc_flags` (so a row
+       can be re-classified, e.g., Phase 0 first sets verified_fg_prospectus
+       then Phase 3 web fallback overrides to single_source_family_fg).
+    2. Appends `tag` to `_qc_flags`.
+    3. Strips any existing robustness suffix from `row_draft["N"]` and
+       appends the canonical suffix for `tag` (or `suffix_override` when
+       provided -- mainly for not_found_fg with a custom searched-list,
+       or for conflicting_fg with a discarded-source footnote).
+
+    Args:
+        staging_row: Phase 0 / Phase 3 staging row dict (must contain
+            `row_draft`, `_qc_flags`).
+        tag: One of FG_ROBUSTNESS_TAGS. ValueError if not.
+        suffix_override: Optional custom col N suffix. If None, uses
+            FG_ROBUSTNESS_COL_N_SUFFIX[tag].
+
+    Returns:
+        The applied tag string (same as `tag`).
+
+    Raises:
+        ValueError: If `tag` is not in FG_ROBUSTNESS_TAGS.
+    """
+    if tag not in FG_ROBUSTNESS_TAGS:
+        raise ValueError(
+            "Invalid F+G robustness tag {!r}. Must be one of: {}".format(
+                tag, FG_ROBUSTNESS_TAGS
+            )
+        )
+
+    qc_flags = staging_row.get("_qc_flags", [])
+    # Drop any pre-existing robustness tag, then add the new one.
+    staging_row["_qc_flags"] = [f for f in qc_flags if f not in FG_ROBUSTNESS_TAGS]
+    staging_row["_qc_flags"].append(tag)
+
+    # Update col N: strip any existing robustness suffix, append the new one.
+    row_draft = staging_row["row_draft"]
+    existing_n = row_draft.get("N") or ""
+    cleaned_n = _FG_ROBUSTNESS_SUFFIX_RE.sub("", existing_n).rstrip()
+    new_suffix = suffix_override if suffix_override else FG_ROBUSTNESS_COL_N_SUFFIX[tag]
+    if cleaned_n:
+        row_draft["N"] = "{} {}".format(cleaned_n, new_suffix)
+    else:
+        row_draft["N"] = new_suffix
+
+    return tag
+
+
+def auto_classify_fg_robustness(staging_row: Dict[str, Any]) -> str:
+    """Auto-classify F+G robustness for a Phase 0 prospectus-extraction row.
+
+    Reads `_provenance` / `_confidence` / `row_draft` for cols F and G and
+    picks one of three Phase-0-determinable tags:
+
+    - `verified_fg_prospectus`: both F and G filled from "firecrawl:..."
+      provenance with both `_confidence == "high"`.
+    - `single_source_prospectus_fg`: both F and G filled from prospectus
+      but at least one has `_confidence != "high"` (low/medium/missing).
+    - `not_found_fg`: F or G is None (Firecrawl returned null and Phase 0
+      finished without a fallback). The skill driver may later re-classify
+      this row to web_cross_checked_fg / single_source_family_fg /
+      conflicting_fg via apply_fg_robustness_tag() once Phase 3 web
+      fallback completes.
+
+    Web-fallback tags (web_cross_checked_fg / single_source_family_fg /
+    conflicting_fg) are NEVER returned by this auto-classifier -- they
+    require agent-side knowledge of web-fallback outcomes that the Python
+    module does not see.
+
+    Mutates `staging_row` by applying the chosen tag (delegates to
+    apply_fg_robustness_tag).
+
+    Returns:
+        The applied tag string.
+    """
+    row_draft = staging_row["row_draft"]
+    provenance = staging_row.get("_provenance", {}) or {}
+    confidence = staging_row.get("_confidence", {}) or {}
+
+    f_value = row_draft.get("F")
+    g_value = row_draft.get("G")
+
+    # Phase 0 result: F or G is None -> Firecrawl returned null and the
+    # skill driver hasn't run web fallback yet (or chose not to). Tag as
+    # not_found_fg; agent can override after Phase 3 if it gathers new data.
+    if f_value is None or g_value is None:
+        return apply_fg_robustness_tag(staging_row, "not_found_fg")
+
+    f_prov = provenance.get("F") or ""
+    g_prov = provenance.get("G") or ""
+    f_from_prospectus = f_prov.startswith("firecrawl:")
+    g_from_prospectus = g_prov.startswith("firecrawl:")
+    f_high = confidence.get("F") == "high"
+    g_high = confidence.get("G") == "high"
+
+    if f_from_prospectus and g_from_prospectus and f_high and g_high:
+        return apply_fg_robustness_tag(staging_row, "verified_fg_prospectus")
+
+    if f_from_prospectus and g_from_prospectus:
+        # Both came from prospectus but at least one isn't high-confidence.
+        return apply_fg_robustness_tag(staging_row, "single_source_prospectus_fg")
+
+    # F or G came from somewhere other than prospectus extraction. The
+    # auto-classifier can't determine whether that source was cross-checked
+    # or single-family -- conservative default is single_source_prospectus_fg
+    # (single source, treat as needs-verify). Skill driver should override
+    # via apply_fg_robustness_tag() once it knows the actual fallback path.
+    return apply_fg_robustness_tag(staging_row, "single_source_prospectus_fg")
 
 
 # ============================================================================

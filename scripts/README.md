@@ -82,6 +82,8 @@ for cand in buckets["new"] + buckets["refresh"]:
 #            )
 #            fc_data = (fc.get("data") or {}).get("json") or fc.get("json") or {}
 #            hs.apply_firecrawl_narrative(row, fc_data)
+#        # Always classify, even if Firecrawl was skipped — None F/G -> not_found_fg
+#        hs.auto_classify_fg_robustness(row)
 
 # 5. On success, clean up the transient PDF cache
 hs.cleanup_cache_dir(cache_dir, had_failures=False)
@@ -112,8 +114,12 @@ python hkex_scraper.py 2026 /path/to/tracker.xlsx    # feed + filter + classify
 | `fetch_targeted_chapters(cand, cache_dir)` | Parse Multi-Files TOC, download SUMMARY/BUSINESS/FINANCIAL chapter PDFs, populate `cand['chapter_urls']` |
 | `extract_fields_from_chapters(cand, target_fy='FY25')` | Build `row_draft` dict with C/D/E/I/J/K/L/N filled; leaves F/G/H/M = None with pending flags for Firecrawl |
 | `apply_firecrawl_narrative(staging_row, fc_data)` | Merge a Firecrawl scrape result into staging row F/G/H/M with off-enum guard for sector |
+| `auto_classify_fg_robustness(staging_row)` | Phase 0 step 8d helper. Reads `_provenance` + `_confidence` + `row_draft["F"/"G"]` and assigns one of `verified_fg_prospectus` / `single_source_prospectus_fg` / `not_found_fg`. Mutates `_qc_flags` + col N suffix in place. Returns the applied tag string. |
+| `apply_fg_robustness_tag(staging_row, tag, suffix_override=None)` | Manually apply / override a F+G robustness tag (used after Phase 3 web fallback for `web_cross_checked_fg` / `single_source_family_fg` / `conflicting_fg`, or to flip an auto-classified tag). Strips any existing robustness tag + suffix before applying the new one. `suffix_override` lets callers customize the col N suffix (e.g., for `not_found_fg` with a custom searched-attempts list). Raises `ValueError` if `tag ∉ FG_ROBUSTNESS_TAGS`. |
 | `FIRECRAWL_NARRATIVE_SCHEMA` | Module-level JSON schema dict: 4 narrative fields with enum constraints |
 | `FIRECRAWL_NARRATIVE_PROMPT` | Module-level extraction prompt (instructs LLM on VIE detection, main-business sector) |
+| `FG_ROBUSTNESS_TAGS` | Module-level 6-tuple of allowed F+G robustness tag strings |
+| `FG_ROBUSTNESS_COL_N_SUFFIX` | Module-level dict mapping each robustness tag to its canonical col N `[…]` suffix |
 | `create_cache_dir(run_date=None)` / `cleanup_cache_dir(...)` | Manage transient per-run PDF cache under `checkpoints/` (gitignored) |
 
 ## Configuration

@@ -37,7 +37,9 @@ hkex-a1-pipeline/
 
 ## Update Workflow
 
-All updates go through the 5-phase skill at [`.claude/skills/a1-pipeline-update/SKILL.md`](./.claude/skills/a1-pipeline-update/SKILL.md), which wraps `scripts/hkex_scraper.py`. When the user says "update A1 tracker", "A1 update", "scan HKEX for new A1s", or any equivalent, Claude Code auto-activates the skill and drives the pipeline. Do not hand-edit the Excel — every save must pass the Phase 5 invariants (HKEX feed verification, dedup, DESC sort, `dd/mm/yyyy`, Arial 8 black, zero fills). Both the scraper module (`scripts/hkex_scraper.py`) and the investment-workflow wrapper (the skill) now ship with this repo — clone it, install deps, configure Firecrawl MCP, and the full pipeline is reproducible end-to-end.
+All updates go through the 5-phase skill at [`.claude/skills/a1-pipeline-update/SKILL.md`](./.claude/skills/a1-pipeline-update/SKILL.md), which wraps `scripts/hkex_scraper.py`. When the user says "update A1 tracker", "A1 update", "scan HKEX for new A1s", or any equivalent, Claude Code auto-activates the skill and drives the pipeline. Do not hand-edit the Excel — every save must pass the Phase 5 invariants (HKEX feed verification, dedup, DESC sort, `dd/mm/yyyy`, Arial 8 black, zero fills, **F+G robustness tag exactly-one-per-row**). Both the scraper module (`scripts/hkex_scraper.py`) and the investment-workflow wrapper (the skill) now ship with this repo — clone it, install deps, configure Firecrawl MCP, and the full pipeline is reproducible end-to-end.
+
+**F+G robustness discipline** (borrowed from `/web-research` Rule 4 / Rule 10): every NEW or REFRESH row carries exactly one tag from `{verified_fg_prospectus, single_source_prospectus_fg, web_cross_checked_fg, single_source_family_fg, conflicting_fg, not_found_fg}` in `_qc_flags` (and a matching `[…]` suffix on col N). Phase 4 Gate 2 surfaces a per-tag count so the analyst sees data robustness at a glance; `not_found_fg` and `conflicting_fg` rows block Phase 5 until resolved. See SKILL.md Phase 4 Robustness Tag Vocabulary for the full decision table; Python helpers are `hs.auto_classify_fg_robustness()` and `hs.apply_fg_robustness_tag()`.
 
 ### Two modes
 
@@ -112,7 +114,7 @@ When in doubt, check the prospectus "HISTORY, DEVELOPMENT AND CORPORATE STRUCTUR
 
 ## Save-Time Invariants (Phase 5 Quality Checks)
 
-Every save of `tracker/a1_pipeline_tracker.xlsx` must satisfy all 12 checkboxes below. If any fail, do not save — fix the in-memory state and re-run. The private workflow wrapper enforces these; this list is here so Claude Code in this repo directory can verify them independently when doing any manual touch-up.
+Every save of `tracker/a1_pipeline_tracker.xlsx` must satisfy all 12 checkboxes below. If any fail, do not save — fix the in-memory state and re-run. The `a1-pipeline-update` skill (`.claude/skills/a1-pipeline-update/SKILL.md`) enforces these in Phase 5; this list is here so Claude Code in this repo directory can verify them independently when doing any manual touch-up.
 
 ### Data-quality checks
 
@@ -162,7 +164,7 @@ In general, **do not hand-edit `tracker/a1_pipeline_tracker.xlsx`** outside the 
 4. Save with a new timestamp in row 1.
 5. Run the 12-item QC checklist against the saved file before committing.
 
-The safer path: invoke the private 5-phase workflow wrapper, let it drive the edit through the pipeline, and accept the Gate 2 diff before write.
+The safer path: invoke the `/a1-pipeline-update` skill, let it drive the edit through the 5-phase pipeline, and accept the Gate 2 diff before write.
 
 ---
 
